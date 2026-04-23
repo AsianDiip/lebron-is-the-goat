@@ -19,7 +19,10 @@ from pathlib import Path
 import requests
 from nba_api.stats.endpoints import PlayByPlayV3
 
-SEASONS = ["2021-22", "2022-23", "2023-24", "2024-25"]
+SEASONS = [
+    "2015-16", "2016-17", "2017-18", "2018-19", "2019-20",
+    "2020-21", "2021-22", "2022-23", "2023-24", "2024-25",
+]
 GAMES_DB = Path(__file__).parent / "raw" / "games.db"
 PBP_DB = Path(__file__).parent / "raw" / "pbp.db"
 PLAYERS_DB = Path(__file__).parent / "raw" / "players.db"

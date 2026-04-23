@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data — raw SQLite databases and logs (large, machine-generated)
+data/raw/*.db
+data/raw/*.db-shm
+data/raw/*.db-wal
+data/raw/*.log
+data/raw/failed_games.txt
+
+# Model artifacts
+model/*.pkl
+
+# Streamlit
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Docs
+CLAUDE.md
+nba_win_prob_architecture_v2.md
+nba_win_probability_spec.md
