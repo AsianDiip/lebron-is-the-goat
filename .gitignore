@@ -23,6 +23,7 @@ data/raw/*.db-shm
 data/raw/*.db-wal
 data/raw/*.log
 data/raw/failed_games.txt
+*.parquet
 
 # Model artifacts
 model/*.pkl
