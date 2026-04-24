@@ -12,8 +12,8 @@ Build an end-to-end ML system that ingests historical NBA player, team, and matc
 
 The output is a single metric — win probability for the home team — updated after every play. The system operates in two modes:
 
-- **Pre-game:** prior probability based on team strength, rest days, home/away, and head-to-head context
-- **In-game:** live probability updated after every scored basket, foul, turnover, or timeout
+- **Pre-game:** prior probability based on team strength, rest days, and home/away context, output by a dedicated calibrated LR model
+- **In-game:** live probability updated after every scored basket, foul, turnover, or timeout, output by an XGBoost model that takes the pre-game probability as an input feature
 
 ---
 
@@ -23,82 +23,102 @@ Five layers run in sequence during training, then loop continuously during live 
 
 ### 2.1 Data layer
 
-All historical data comes from the NBA Stats API via the `nba_api` Python package. No API key required. Rate-limit all calls (~1 req/sec).
+All historical data comes from the NBA Stats API via the `nba_api` Python package. No API key required. Rate-limit all calls with `time.sleep(0.6)` between requests.
 
-**Target seasons:** 2021-22 through 2023-24 for training, 2024-25 for validation — recent enough to reflect current pace and style of play.
+**Target seasons:** 2015-16 through 2024-25 (~13K games)
 
 | Data type | nba_api endpoint | Key fields |
 |---|---|---|
 | Game logs | `LeagueGameLog` | game_id, date, home/away, W/L, scores |
-| Team efficiency | `LeagueDashTeamStats` | OffRtg, DefRtg, Pace, eFG%, TOV%, OREB% |
-| Player box scores | `BoxScoreTraditionalV2` | PTS, AST, REB, STL, BLK, TOV, FG%, TS% |
-| Play-by-play | `PlayByPlayV2` | event_type, score, clock, period, team |
+| Team efficiency | `LeagueDashTeamStats` (Advanced) | OffRtg, DefRtg, Pace, eFG%, TOV%, OREB%, AST% |
+| Player box scores | `BoxScoreTraditionalV3` | PTS, AST, REB, STL, BLK, TOV, FG%, TS% |
+| Play-by-play | `PlayByPlayV3` | event_type, score, clock, period, team |
 
-**Storage:** Use **SQLite** for raw fetched data (game logs, box scores, play-by-play) with indexes on `game_id`, `date`, and `team_id` — this enables fast filtered queries during feature engineering without scanning entire files. Use **parquet** only for the final processed feature matrices (`train.parquet`, `val.parquet`).
+**Storage:** SQLite for raw fetched data (`data/raw/*.db`) with indexes on `game_id`, `season`, and `team_id`. Parquet for final processed feature matrices (`data/processed/*.parquet`).
 
 ### 2.2 Feature engineering layer
 
 Two categories of features are concatenated into a single vector at inference time.
 
-**Pre-game features** (computed once before tip-off, re-fetched at T-10 min to capture late injury/lineup news):
-- Rolling 10-game averages for both teams: OffRtg, DefRtg, Pace, eFG%, TOV%, OREB%
-- ELO rating for each team (updated after every game result)
-- Home/away flag
-- Days of rest for each team
-- Travel distance (back-to-back flag as proxy)
-- Head-to-head win % over last 2 seasons
-- Starting lineup quality score (sum of top-5 player TS% rolling averages)
+**Pre-game features** (computed once before tip-off, frozen at tip-off — no lineup-lock re-fetch):
+- `elo_diff` — rolling ELO (K=100, walk-forward per game, regress to mean each season)
+- `efg_pct_diff` — season-to-date eFG%
+- `ortg_diff`, `drtg_diff` — per-100-possession offensive and defensive ratings
+- `prev_season_win_pct_diff` — prior season win %, stabilizes early-season predictions
+- `rest_days_diff` — days of rest differential
+- `home_flag` — always 1 for home team in this model
+- `ast_pct_diff`, `tov_pct_diff` — ball movement and turnover rate differential
+
+No H2H (head-to-head) feature. No lineup-lock re-fetch.
 
 **In-game features** (updated after every play event):
-- Score differential (home minus away)
-- Time remaining in game (seconds) — see clock encoding note in Section 7
-- Current quarter/period
-- Possession indicator
-- Home team foul count, away team foul count
-- Foul trouble indicator: flag for any top-3 player (by TS%) with 4+ fouls
-- Momentum: points scored by each team in last 3 minutes and last 5 minutes (game clock, not wall clock)
-- Run indicator: current scoring run length (e.g. home team on a 10-0 run)
-- Quarters behind: number of quarters in which the team trailed at the buzzer (captures "dug a hole early" vs "just fell behind")
-- Clutch time flag: Q4 (or OT) with ≤5 minutes remaining and score differential ≤5
+- `score_diff` — home minus away score
+- `seconds_remaining` — total seconds remaining in game (see clock encoding in Section 7)
+- `pre_game_prob` — output of the pre-game LR model; anchors predictions in Q1 when score is near 0
+- `home_fg_pct_live`, `away_fg_pct_live` — live field goal percentage for each team
+- `home_fouls`, `away_fouls` — raw cumulative foul counts (not FT rate)
+- `turnover_diff_live` — cumulative turnover differential
+- `timeout_remaining_diff` — timeouts remaining, home minus away
+- `last_5_poss_swing` — momentum proxy; net points over last 5 possessions
+- `quarter` — current period (1–4, OT)
+- `clutch_flag` — 1 if Q4 (or OT) and `abs(score_diff) <= 5`
 
-**Training row structure:** Each play-by-play event becomes one training row. Label = 1 if the home team won the game, 0 otherwise. A single season produces ~500,000+ rows.
+**Training row structure:** Each play-by-play event becomes one training row. Label = 1 if the home team won the game, 0 otherwise.
 
 ### 2.3 Model layer
 
-**Primary model:** XGBoost classifier (`XGBClassifier`)
-- Objective: `binary:logistic`
-- Eval metric: `logloss`
-- Train on 2021-22 and 2022-23, calibrate on first half of 2023-24, validate on second half of 2023-24
-- Apply isotonic regression calibration (`CalibratedClassifierCV(cv='prefit', method='isotonic')`) fitted on the calibration split — **not** the validation split, to avoid contaminating the held-out evaluation
-- Apply `scale_pos_weight` or stratified sampling to account for class skew in late-game blowout rows
+**Two-stage architecture:**
+
+**Stage 1 — Pre-game model** (`model/train_pregame.py`):
+- scikit-learn `LogisticRegression` + `CalibratedClassifierCV` (Platt scaling)
+- Input: pre-game features listed above
+- Output: `pre_game_prob` (float 0.0–1.0)
+- Target: ~66% accuracy, ECE <4%
+- Saved to `model/pregame.pkl`
+
+**Stage 2 — In-game model** (`model/train_ingame.py`):
+- XGBoost (`binary:logistic`, 500 trees, depth 6)
+- Input: in-game features listed above, including `pre_game_prob` from Stage 1
+- Post-hoc isotonic calibration on a dedicated calibration split
+- Target: Brier score <0.18, ECE <5%
+- Saved to `model/ingame.pkl`
+
+**Train/val/test split (by full season — no temporal leakage):**
+- Train: 2015–2022 (~8K games)
+- Calibration: separate split carved from training data (never the val set)
+- Val: 2022–2023 (~1.2K games)
+- Test: 2023–2024 (~1.2K games)
+- Live: 2024–2025 (held out)
+
+**Calibration:** `CalibratedClassifierCV(cv='prefit', method='isotonic')` fitted on a dedicated calibration split — never on the validation split. Three-way split: train → calibrate → validate.
 
 **Validation checks:**
-- Reliability diagram: when model says 70%, home team should win ~70% of the time; flag any bucket with fewer than 500 samples as unreliable
-- Plot win probability curves for 5–10 historical games and verify they tell the right story (big leads → high probability, comebacks → visible swings)
-- Brier score as secondary calibration metric
+- Reliability diagram: when model says 70%, home team should win ~70% of the time
+- Brier score as primary calibration metric (target <0.18)
+- ECE <5% (10-bin)
+- AUC-ROC >0.80
+- Evaluate separately on the uncertainty region: Q2/Q3, score differential within ±10 pts
 
-**Optional upgrade (after baseline works):** LSTM or Transformer that treats each game as a sequence of events — better at capturing momentum and runs than XGBoost on tabular snapshots. `GameState.play_log` already stores the full event sequence; ensure event encoding is consistent from day one to avoid reprocessing.
+**Optional upgrade (after baseline works):** LSTM or Transformer that treats each game as a sequence of events. `GameState.play_log` stores the full event sequence — ensure event encoding is consistent from day one.
 
 ### 2.4 Real-time inference pipeline
 
 Polling loop that runs during a live game:
 
 ```
-every ~15 seconds:
-  1. Poll PlayByPlayV2 for new events since last check
+every 30 seconds:
+  1. Poll PlayByPlayV3 for new events since last check
   2. Deduplicate new events by event_id (not index — API may reorder buffer)
   3. For each new event:
-     a. Update in-game state object (score, clock, fouls, possession)
+     a. Update in-game state object (score, clock, fouls, timeouts, turnovers)
      b. Recompute in-game feature vector
      c. Concatenate with pre-game feature vector (frozen at tip-off)
-     d. Run model.predict_proba()
+     d. Run ingame_model.predict_proba()
      e. Emit updated probability
-  4. Log (timestamp, event_description, home_win_prob) to output store on new event only — not on every poll
+  4. Log (timestamp, event_description, home_win_prob) on new events only — not every poll
 ```
 
 Keep the full game state as an in-memory object updated incrementally — do not recompute from scratch on each poll.
-
-**Pre-game lineup lock:** At T-10 minutes before tip-off, re-fetch injury reports and starting lineup data, recompute `pregame_features`, then freeze them for the duration of the game.
 
 ### 2.5 Output layer
 
@@ -113,26 +133,34 @@ Keep the full game state as an in-memory object updated incrementally — do not
 ```
 nba-win-prob/
 ├── data/
-│   ├── raw/                  # Fetched API data (SQLite)
-│   ├── processed/            # Feature matrices (parquet)
-│   ├── fetch_games.py        # LeagueGameLog + LeagueDashTeamStats fetching
-│   ├── fetch_pbp.py          # PlayByPlayV2 fetching
-│   └── fetch_players.py      # BoxScoreTraditionalV2 fetching
+│   ├── raw/                    # SQLite DBs (games.db, pbp.db, players.db)
+│   ├── processed/              # Parquet feature matrices
+│   ├── fetch_games.py
+│   ├── fetch_pbp.py
+│   └── fetch_players.py
 ├── features/
-│   ├── pregame.py            # Pre-game feature computation
-│   ├── ingame.py             # In-game state + feature updates
-│   └── pipeline.py           # Combines both into a single vector
+│   ├── elo.py                  # Walk-forward ELO ratings
+│   ├── pregame.py              # Pre-game feature computation
+│   ├── ingame.py               # In-game snapshot feature computation
+│   └── pipeline.py             # Orchestration
 ├── model/
-│   ├── train.py              # XGBoost training + calibration
-│   ├── evaluate.py           # Reliability diagram, Brier score, curve plots
-│   └── model.joblib          # Saved trained model (joblib format)
+│   ├── train_pregame.py        # LR + Platt scaling
+│   ├── train_ingame.py         # XGBoost + isotonic calibration
+│   ├── evaluate.py             # Brier, ECE, reliability diagrams
+│   ├── pregame.pkl
+│   └── ingame.pkl
 ├── live/
-│   ├── game_state.py         # GameState class (in-memory state object)
-│   └── poller.py             # Polling loop + probability logging / output
+│   ├── game_state.py           # GameState class (in-memory)
+│   ├── poller.py               # PlayByPlayV3 polling loop
+│   └── api.py                  # FastAPI server
 ├── dashboard/
-│   └── app.py                # Streamlit dashboard
+│   └── app.py                  # Streamlit dashboard
 ├── notebooks/
-│   └── eda.ipynb             # Exploratory data analysis
+│   ├── eda.ipynb
+│   ├── model_analysis.ipynb
+│   └── replay.ipynb
+├── tests/
+│   └── test_no_leakage.py
 ├── requirements.txt
 └── README.md
 ```
@@ -153,32 +181,26 @@ class GameState:
     away_score: int
     period: int
     clock_seconds: int        # seconds remaining in current quarter
-    possession: str           # "home" | "away"
     home_fouls: int
     away_fouls: int
-    play_log: list[dict]      # all events so far this game (used for sequence models)
-    pregame_features: dict    # static, frozen after lineup lock at T-10 min
+    home_timeouts: int
+    away_timeouts: int
+    home_turnovers: int
+    away_turnovers: int
+    play_log: list[dict]      # all events so far this game
+    pregame_features: dict    # static, frozen at tip-off
 
     def update(self, event: dict) -> None: ...
     def to_feature_vector(self) -> np.ndarray: ...
-```
-
-### `WinProbModel` (model/train.py)
-Thin wrapper around the trained XGBoost + calibrator.
-
-```python
-class WinProbModel:
-    def predict(self, feature_vector: np.ndarray) -> float:
-        # Returns home team win probability as float 0.0–1.0
 ```
 
 ### `Poller` (live/poller.py)
 
 ```python
 class Poller:
-    def __init__(self, game_id: str, model: WinProbModel, interval_sec: int = 15): ...
+    def __init__(self, game_id: str, pregame_model, ingame_model, interval_sec: int = 30): ...
     def run(self) -> None:
-        # Polls API, deduplicates by event_id, updates GameState,
+        # Polls PlayByPlayV3, deduplicates by event_id, updates GameState,
         # emits and logs probability on each new event
 ```
 
@@ -186,78 +208,84 @@ class Poller:
 
 ## 5. Development Plan
 
-### Phase 1 — Data collection & environment setup (~1 week)
+### Phase 1 — Data collection & environment setup
 
 **Goal:** Clean, queryable dataset of historical games and play-by-play events.
 
-- Install dependencies: `nba_api`, `pandas`, `numpy`, `xgboost`, `scikit-learn`, `requests`, `sqlite3`, `jupyter`, `streamlit`, `joblib`
-- Pull 3 seasons of game logs (2021-22 through 2023-24) via `LeagueGameLog`
-- Pull team efficiency stats per season via `LeagueDashTeamStats`
-- Pull player box scores via `BoxScoreTraditionalV2` for all games
-- Pull play-by-play for all games via `PlayByPlayV2` (this takes time — batch and cache aggressively)
-- Build local SQLite storage layer: write `fetch_games.py`, `fetch_pbp.py`, and `fetch_players.py` modules that check local cache before hitting the API
-- **Data validation:** after fetching, assert that `game_id` values are consistent across all three tables; any game present in logs but missing play-by-play must raise an error rather than silently producing corrupted training rows
+- Pull 10 seasons of game logs (2015-16 through 2024-25) via `LeagueGameLog`
+- Pull team efficiency stats (Advanced) per season via `LeagueDashTeamStats`
+- Pull player box scores via `BoxScoreTraditionalV3` for all games
+- Pull play-by-play for all games via `PlayByPlayV3` (batch and cache aggressively — resumable)
+- SQLite storage layer: `fetch_games.py`, `fetch_pbp.py`, `fetch_players.py` — all check cache before hitting API
+- **Data validation:** every game in `game_logs` must have corresponding PBP and box score rows; missing rows raise an error
 
-**Deliverable:** `/data/raw/` populated, fetch modules working, basic EDA notebook
-
----
-
-### Phase 2 — Feature engineering (1–2 weeks)
-
-**Goal:** Feature matrix with ~500k+ labeled rows ready for model training.
-
-- Implement `pregame.py`: rolling averages, ELO updater, rest days, H2H win %, home/away flag
-- Implement `ingame.py`: score diff, time remaining, momentum windows, run tracker, foul counts, foul trouble indicator, quarters-behind counter, clutch time flag
-- Build training dataset: iterate all historical games, generate one row per play event, label with final game outcome
-- **Leakage test:** for every training row, assert that no feature value could only be derived from plays that occur after the labeled event; use the play clock timestamp as the enforcement boundary
-- EDA: correlation heatmap, feature distributions, verify class balance across game states (early game rows should be near 50/50)
-- Feature selection: drop zero-importance or highly correlated features
-
-**Deliverable:** `/data/processed/train.parquet` and `val.parquet`
+**Deliverable:** `data/raw/` populated, fetch modules working, basic EDA notebook
 
 ---
 
-### Phase 3 — Model training & evaluation (~2 weeks)
+### Phase 2 — Feature engineering
 
-**Goal:** Calibrated XGBoost model with a verified reliability diagram.
+**Goal:** Feature matrices ready for two-stage model training.
 
-- Train baseline `XGBClassifier` on 2021-22 and 2022-23 data, evaluate log-loss on validation split
-- Tune hyperparameters: `max_depth`, `n_estimators`, `learning_rate`, `subsample`, `colsample_bytree`
-- Calibrate outputs: fit `CalibratedClassifierCV(cv='prefit', method='isotonic')` on the calibration split (first half of 2023-24); evaluate final reliability on the held-out validation split (second half of 2023-24)
-- Plot reliability diagram — flag buckets with fewer than 500 samples; verify calibration holds in clutch situations (Q4, close games)
-- Plot win probability curves for 10 historical games — sanity check that curves make intuitive sense
-- Save model to `model/model.joblib` using `joblib.dump()`
+- `features/elo.py`: walk-forward ELO (K=100, regress to mean each season start)
+- `features/pregame.py`: ELO diff, rolling team stats (eFG%, ORtg, DRtg, AST%, TOV%), rest days, prev season win pct
+- `features/ingame.py`: score diff, seconds remaining, live FG%, foul counts, timeout diff, turnover diff, last_5_poss_swing, clutch_flag
+- Build training dataset: one row per play event, labeled with final game outcome
+- **Leakage test:** per-row assertion that no feature uses data from plays after the event timestamp
+- Output: `pregame_features.parquet`, `ingame_snapshots.parquet`
 
-**Deliverable:** Saved calibrated model, evaluation notebook with reliability diagram
+**Deliverable:** `data/processed/` populated, leakage tests passing
 
 ---
 
-### Phase 4 — Real-time inference pipeline (1–2 weeks)
+### Phase 3 — Model training & evaluation
+
+**Goal:** Two calibrated models with verified reliability diagrams.
+
+- Train pre-game LR model; calibrate with Platt scaling; evaluate ECE <4%
+- Train in-game XGBoost baseline (score_diff + seconds_remaining only)
+- Add all in-game features including `pre_game_prob`; hyperparameter sweep
+- Post-hoc isotonic calibration on dedicated calibration split (never val set)
+- SHAP feature importance; reliability diagrams; win probability curves on 10 historical games
+- Save `model/pregame.pkl` and `model/ingame.pkl` with `joblib`
+
+**Deliverable:** Both models saved, evaluation notebook with reliability diagrams, Brier <0.18
+
+---
+
+### Phase 4 — Real-time inference pipeline
 
 **Goal:** Polling loop that emits updated win probability after every live play.
 
-- Implement `GameState` class with `update()` and `to_feature_vector()` methods
-- Implement lineup lock: re-fetch injury/availability data at T-10 min before tip-off, recompute and freeze `pregame_features`
-- Implement `Poller` class: poll `PlayByPlayV2` every 15 seconds, deduplicate new events by `event_id`, update `GameState`, call model, log output
-- Test against a completed historical game by replaying its play-by-play in sequence and comparing emitted probabilities to expected curve shape
-- Handle edge cases: overtime periods (5-minute OT, not 12-minute quarters), game delays, API rate limits, missing clock data
-- Add graceful retry logic for API failures
+- Implement `GameState` class with `update()` and `to_feature_vector()`
+- Implement `Poller`: polls `PlayByPlayV3` every 30 seconds, deduplicates by `event_id`, updates `GameState`, calls both models in sequence, logs output
+- Test against a completed historical game by replaying play-by-play in sequence
+- Handle edge cases: OT (5-minute periods, not 12), API failures, missing clock data
+- Build FastAPI server with `/pregame` and `/live` endpoints
 
 **Deliverable:** `live/` module working end-to-end on a replayed historical game
 
 ---
 
-### Phase 5 — Dashboard & polish (~1 week)
+### Phase 5 — Dashboard & polish
 
 **Goal:** Usable prototype with a live probability display.
 
-- Build Streamlit app: game selector, live probability curve (line chart updating in real time via `st.empty()` + rerun), current probability as large number, quarter markers on x-axis, key play annotations on hover
-- Note: Streamlit is not a true push model — document the refresh mechanism and its latency limitation. If reliability matters long-term, consider a FastAPI + WebSocket backend.
-- Add pre-game view: show model's prior probability at tip-off with contributing factors (ELO diff, rest advantage, home/away)
-- Backtest calibration on hold-out season: reliability diagram, average log-loss per quarter
-- Write README with setup instructions and architecture summary
+- Streamlit app: game selector, live probability curve, current probability, quarter markers, key play annotations
+- Note: Streamlit is not a true push model — document refresh latency limitation
+- Historical replay mode: pick any past game, watch the curve unfold
+- Backtest report: per-quarter calibration on test set
+- README with setup instructions and architecture summary
 
 **Deliverable:** Running Streamlit dashboard, backtest report
+
+---
+
+### Phase 6 — Sequence Model Upgrade (Optional)
+
+- PyTorch LSTM over play-by-play sequences; target: beat XGBoost Brier by >0.01
+- Train with Brier loss; ECE <3%
+- Compare XGBoost vs LSTM on uncertainty region specifically
 
 ---
 
@@ -274,24 +302,28 @@ streamlit>=1.28.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 joblib>=1.3.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
 ```
 
 ---
 
 ## 7. Key Implementation Notes
 
-**Rate limiting:** The NBA Stats API is unofficial and will return 429 errors if polled too aggressively. Add `time.sleep(0.6)` between all API calls during data collection. During live polling, 15-second intervals are safe.
+**Rate limiting:** `time.sleep(0.6)` between all API calls during data collection. Live polling uses 30-second intervals.
 
-**ELO implementation:** Initialize all teams at 1500. After each game, update winner += K * (1 - expected), loser -= K * (1 - expected), where K=20 and expected = 1 / (1 + 10^((loser_elo - winner_elo) / 400)). Reset toward 1500 at the start of each season (regression to mean).
+**ELO implementation:** Initialize all teams at 1500. After each game: winner += K * (1 - expected), loser -= K * (expected), where K=100 and expected = 1 / (1 + 10^((loser_elo - winner_elo) / 400)). Regress toward 1500 at the start of each new season.
 
-**Momentum features:** Compute points scored by each team in the last 180 seconds (3 min) and last 300 seconds (5 min) of game clock — not wall-clock time. Use the `clock` field from play-by-play events.
+**Momentum features:** `last_5_poss_swing` = net points over the last 5 possessions, derived from play-by-play clock timestamps (not wall-clock time).
 
-**Feature leakage:** Be careful not to include any features derived from future plays when constructing training rows. Each row's feature vector must only use information available at the moment that play occurred. Enforce this with a per-row timestamp assertion during dataset construction.
+**Feature leakage:** Each training row's feature vector must only use information available at the moment that play occurred. Enforce with a per-row timestamp assertion during dataset construction in Phase 2.
 
-**Calibration:** Raw XGBoost probabilities tend to be overconfident. Always apply `CalibratedClassifierCV(cv='prefit', method='isotonic')` on a dedicated calibration split and verify with a reliability diagram before using the model in production. Do not fit the calibrator on your validation set.
+**Calibration:** Always apply `CalibratedClassifierCV(cv='prefit', method='isotonic')` on a dedicated calibration split. Never fit the calibrator on the validation set. Verify with a reliability diagram before using either model.
 
-**Clock encoding:** Express time remaining as total seconds in the game (not just the quarter). A possession with 10 seconds left in Q4 is very different from one with 10 seconds left in Q1. For regulation: `time_remaining_game = (4 - period) * 720 + clock_seconds`. For overtime: each OT period is 300 seconds, so `time_remaining_game = -(ot_period - 1) * 300 - (300 - clock_seconds)` (negative values indicate overtime, distinct from regulation).
+**Clock encoding:** Express time remaining as total seconds in the game. For regulation: `time_remaining_game = (4 - period) * 720 + clock_seconds`. OT periods are 300 seconds each and must be handled separately — the formula above produces garbage for OT.
 
-**Model persistence:** Use `joblib.dump()` / `joblib.load()` rather than `pickle` for saving the trained model. joblib is significantly faster for numpy-heavy objects and is already in the dependency list.
+**V3 API:** Use `PlayByPlayV3` and `BoxScoreTraditionalV3` throughout. V2 endpoints are deprecated. V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
 
-**Event deduplication:** During live polling, deduplicate on `event_id` from the play-by-play response, not on positional index. The NBA Stats API occasionally re-orders or re-delivers events in the buffer, and index-based deduplication will silently drop or double-count plays.
+**Model persistence:** `joblib.dump()` / `joblib.load()` — not `pickle`. Artifacts are `model/pregame.pkl` and `model/ingame.pkl`.
+
+**Event deduplication:** During live polling, deduplicate on `event_id` from `PlayByPlayV3`, not on positional index. The API can reorder or re-deliver events in the buffer.
