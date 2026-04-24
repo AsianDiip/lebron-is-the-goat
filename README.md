@@ -29,7 +29,7 @@ Data → Features → Model → Live Inference → Dashboard
 | Phase | Status | Description |
 |---|---|---|
 | Phase 1 — Data collection | **Complete** | Fetch modules and SQLite storage implemented |
-| Phase 2 — Feature engineering | Not started | Pre-game and in-game feature computation |
+| Phase 2 — Feature engineering | **Complete** | Pre-game and in-game feature computation |
 | Phase 3 — Model training | Not started | Two-stage LR + XGBoost training and calibration |
 | Phase 4 — Live inference | Not started | Polling loop and GameState class |
 | Phase 5 — Dashboard | Not started | Streamlit probability curve display |
@@ -110,13 +110,18 @@ jupyter notebook notebooks/eda.ipynb
 
 ### Phase 2 — Feature Engineering
 
-> Not yet implemented.
-
 ```bash
 python features/pipeline.py
 ```
 
 Outputs `data/processed/pregame_features.parquet` and `data/processed/ingame_snapshots.parquet`. Each in-game row is one play-by-play event with a full feature vector and a binary label (1 = home team won).
+
+**Implementation notes:**
+
+- `features/elo.py`: Walk-forward ELO ratings (K=100). Each team's ELO is recorded *before* the game it is used for. Ratings regress 25% toward 1500 at each season boundary.
+- `features/pregame.py`: Season-to-date eFG%, AST rate, and TOV rate are computed from `player_box_scores` using a cumulative sum shifted by one game (excludes the current game). Offensive and defensive ratings use previous-season values from `team_efficiency` since true per-possession ratings can't be derived from box scores alone. First season (2015-16) falls back to league averages.
+- `features/ingame.py`: `last_5_poss_swing` is computed by a per-game possession state machine that identifies possession-ending events (made shots, turnovers, last free throw in sequence, defensive rebounds) and tracks a rolling deque of the last 5 possessions. Timeout team ownership is parsed from the PBP `description` field (the `team_id` column is 0 for timeout events). OT clock encodes as negative `seconds_remaining` (OT1 runs 0 to -300, OT2 runs -300 to -600, etc.).
+- `tests/test_no_leakage.py`: Sample-based leakage assertions. Run with `pytest tests/test_no_leakage.py -v`.
 
 ---
 

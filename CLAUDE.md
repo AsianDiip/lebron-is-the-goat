@@ -18,10 +18,16 @@ These supersede any conflicts between `nba_win_prob_architecture_v2.md` and olde
 - **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate.
 - **Live polling:** `PlayByPlayV3` (not V2) every 30 seconds. Deduplicate by `event_id`, not positional index.
 - **Model artifacts:** `model/pregame.pkl` and `model/ingame.pkl`, serialized with `joblib`.
+- **Rolling stats (eFG%, AST rate, TOV rate):** Computed season-to-date from `player_box_scores` using `cumsum().shift(1)` within each (team, season) group — this excludes the current game. ORtg and DRtg use previous-season values from `team_efficiency` (true per-possession ratings can't be derived from box scores alone). First game of a season falls back to the prior season's full values; 2015-16 game 1 uses league averages.
+- **Timeout team identification:** `team_id` is 0 for timeout PBP events. The responsible team is parsed from the `description` field via regex (first token before ` Timeout`), matched case-insensitively against team abbreviations from `game_logs`.
+- **Possession identification for `last_5_poss_swing`:** Per-game state machine treating Made Shot, Turnover, last Free Throw in sequence (`"Free Throw N of N"`), and defensive Rebound as possession-ending events. And-1 free throw edge case is a known approximation. Technical FTs are not treated as possession-enders.
+- **Score forward-fill:** PBP `score_home`/`score_away` are NULL on non-scoring events (~60% of rows). Forward-filled with `ffill()` after sorting by `action_number`; initial value is (0, 0).
+- **OT clock encoding:** `seconds_remaining` goes negative for overtime — OT1 runs from 0 to -300, OT2 from -300 to -600, etc. Formula: `-((period - 5) * 300 + (300 - clock_seconds))`. Combined with the raw `quarter` feature, the model can disambiguate end-of-Q4 from start-of-OT.
+- **`pre_game_prob` in in-game features:** Set to `0.5` as a placeholder during feature building. Replaced at training time by `model/train_ingame.py`, which runs the pre-game model over the pregame feature set to generate actual predictions.
 
-## Planned commands (not yet implemented)
+## Commands
 
-Once the codebase is built out per the spec, the expected commands are:
+Phase 1 and Phase 2 are implemented. Phases 3–5 are not yet implemented.
 
 ```bash
 # Data collection (run once, takes hours — batches and caches aggressively)
