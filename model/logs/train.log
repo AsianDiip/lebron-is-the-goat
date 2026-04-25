@@ -1,0 +1,49 @@
+=== NBA Win Probability — Model Training ===
+Logs: /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/logs
+
+[15:58:41] Starting train_pregame.py...
+============================================================
+Phase 3 — Pre-game model training
+============================================================
+Loaded pregame features: 11,974 rows
+Split → train: 8,289  val: 1,230  test: 1,230  holdout: 1,225
+Calibration carve → train_proper: 7,046 games  calibration: 1,243 games
+Base LR trained.
+Platt calibration fitted on calibration split.
+[VAL]  accuracy=0.6171  brier=0.2297  ece=0.0261  auc=0.6423
+[TEST]  accuracy=0.6431  brier=0.2174  ece=0.0409  auc=0.7042
+Cross-val predictions for 8,289 training games done.
+pre_game_prob generated for 11,974 games  (mean=0.5683)
+Model saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/pregame.pkl
+Probabilities saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/data/processed/pregame_probs.parquet
+
+Done. Target metrics: accuracy ~66%, ECE <4%, AUC-ROC >0.78
+[15:58:42] train_pregame.py complete.
+
+[15:58:42] Starting train_ingame.py...
+============================================================
+Phase 3 — In-game model training
+============================================================
+Loading ingame snapshots (5.5M rows — may take a moment)...
+Loaded ingame snapshots: 5,567,812 rows
+Replaced pre_game_prob placeholder  (mean=0.5683)
+Split → train: 3,853,816  val: 574,404  test: 567,669  holdout: 571,923
+Calibration carve by game_id → train_proper: 3,274,362 rows (85.0%)  calibration: 579,454 rows (15.0%)
+Using default params: {'objective': 'binary:logistic', 'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.05, 'subsample': 0.8, 'colsample_bytree': 0.8, 'min_child_weight': 10, 'tree_method': 'hist', 'random_state': 42, 'n_jobs': -1}
+[0]	validation_0-logloss:0.66457
+[100]	validation_0-logloss:0.49104
+[146]	validation_0-logloss:0.49128
+XGBoost training done. Best iteration: 96
+[VAL (uncalibrated)]  brier=0.1653  ece=0.0108  auc=0.8275
+Isotonic calibration fitted on calibration split.
+[VAL (calibrated)]  brier=0.1664  ece=0.0262  auc=0.8273
+[TEST (calibrated)]  brier=0.1509  ece=0.0136  auc=0.8624
+Model saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/ingame.pkl
+
+Done. Target metrics: Brier <0.18, ECE <5%, AUC-ROC >0.80
+[15:58:47] train_ingame.py complete.
+
+=== Training complete. Artifacts: ===
+-rw-r--r--@ 1 chen  staff   670K Apr 24 15:58 /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/ingame.pkl
+-rw-r--r--@ 1 chen  staff   2.1K Apr 24 15:58 /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/pregame.pkl
+-rw-r--r--@ 1 chen  staff   185K Apr 24 15:58 /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/data/processed/pregame_probs.parquet

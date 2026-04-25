@@ -1,0 +1,50 @@
+============================================================
+Phase 3 — In-game model training
+============================================================
+Loading ingame snapshots (5.5M rows — may take a moment)...
+Loaded ingame snapshots: 5,567,812 rows
+Replaced pre_game_prob placeholder  (mean=0.5683)
+Split → train: 3,853,816  val: 574,404  test: 567,669  holdout: 571,923
+Calibration carve by game_id → train_proper: 3,274,362 rows (85.0%)  calibration: 579,454 rows (15.0%)
+
+--- Hyperparameter Sweep Stage 1: structure params ---
+  Searching 27 combinations...
+  [5/27] best brier so far: 0.1649
+  [10/27] best brier so far: 0.1648
+  [15/27] best brier so far: 0.1648
+  [20/27] best brier so far: 0.1648
+  [25/27] best brier so far: 0.1648
+Stage 1 best: {'max_depth': 4, 'learning_rate': 0.05, 'min_child_weight': 20}  brier=0.1648
+
+--- Hyperparameter Sweep Stage 2: regularization params ---
+  Searching 81 combinations...
+  [5/81] best brier so far: 0.1650
+  [10/81] best brier so far: 0.1650
+  [15/81] best brier so far: 0.1647
+  [20/81] best brier so far: 0.1647
+  [25/81] best brier so far: 0.1647
+  [30/81] best brier so far: 0.1647
+  [35/81] best brier so far: 0.1647
+  [40/81] best brier so far: 0.1647
+  [45/81] best brier so far: 0.1647
+  [50/81] best brier so far: 0.1647
+  [55/81] best brier so far: 0.1647
+  [60/81] best brier so far: 0.1647
+  [65/81] best brier so far: 0.1647
+  [70/81] best brier so far: 0.1647
+  [75/81] best brier so far: 0.1647
+  [80/81] best brier so far: 0.1647
+Stage 2 best: {'subsample': 0.9, 'colsample_bytree': 1.0, 'reg_alpha': 0.1, 'reg_lambda': 5.0}  brier=0.1647
+
+Final best params: {'objective': 'binary:logistic', 'n_estimators': 1000, 'tree_method': 'hist', 'random_state': 42, 'max_depth': 4, 'learning_rate': 0.05, 'min_child_weight': 20, 'subsample': 0.9, 'colsample_bytree': 1.0, 'reg_alpha': 0.1, 'reg_lambda': 5.0}
+[0]	validation_0-logloss:0.66495
+[100]	validation_0-logloss:0.49005
+[179]	validation_0-logloss:0.48972
+XGBoost training done. Best iteration: 129
+[VAL (uncalibrated)]  brier=0.1647  ece=0.0132  auc=0.8292
+Isotonic calibration fitted on calibration split.
+[VAL (calibrated)]  brier=0.1657  ece=0.0271  auc=0.8290
+[TEST (calibrated)]  brier=0.1505  ece=0.0133  auc=0.8631
+Model saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/ingame.pkl
+
+Done. Target metrics: Brier <0.18, ECE <5%, AUC-ROC >0.80

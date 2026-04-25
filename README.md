@@ -17,7 +17,7 @@ Data → Features → Model → Live Inference → Dashboard
 | Layer | Location | Description |
 |---|---|---|
 | Data | `data/` | Fetch 2015–2025 game logs, team stats, and play-by-play from the NBA Stats API into SQLite |
-| Features | `features/` | Pre-game features (ELO, rolling stats, rest days) + in-game features (score diff, momentum, fouls, clutch flag) |
+| Features | `features/` | Pre-game features (ELO, rolling stats, rest days) + in-game features (score diff, momentum, live FG%/2PT%/3PT%/FT%, fouls, clutch flag) |
 | Model | `model/` | Two-stage: calibrated LR pre-game model → XGBoost in-game model with isotonic calibration |
 | Live inference | `live/` | Polling loop that updates win probability after every play event |
 | Dashboard | `dashboard/` | Streamlit probability curve display |
@@ -30,7 +30,7 @@ Data → Features → Model → Live Inference → Dashboard
 |---|---|---|
 | Phase 1 — Data collection | **Complete** | Fetch modules and SQLite storage implemented |
 | Phase 2 — Feature engineering | **Complete** | Pre-game and in-game feature computation |
-| Phase 3 — Model training | Not started | Two-stage LR + XGBoost training and calibration |
+| Phase 3 — Model training | **Complete** | Two-stage LR + XGBoost, stratified calibration, evaluation |
 | Phase 4 — Live inference | Not started | Polling loop and GameState class |
 | Phase 5 — Dashboard | Not started | Streamlit probability curve display |
 
@@ -127,16 +127,21 @@ Outputs `data/processed/pregame_features.parquet` and `data/processed/ingame_sna
 
 ### Phase 3 — Model Training
 
-> Not yet implemented.
-
 ```bash
 # Train pre-game model first — ingame model depends on its output
-python model/train_pregame.py
-python model/train_ingame.py
-python model/evaluate.py
+python model/train_pregame.py      # outputs model/pregame.pkl + data/processed/pregame_probs.parquet
+python model/train_ingame.py       # outputs model/ingame.pkl
+python model/train_ingame.py --sweep  # optional: 2-stage hyperparameter search (~2 hrs)
+python model/evaluate.py           # saves figures to model/eval_figures/
 ```
 
-Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 2023–2024, Live 2024–2025 held out. Calibration uses a dedicated split carved from training data — never the val set. Saves `model/pregame.pkl` and `model/ingame.pkl`.
+Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 2023–2024, Live 2024–2025 held out.
+
+**Two-stage architecture:**
+- Pre-game: calibrated Logistic Regression (Platt scaling) outputs `pre_game_prob`
+- In-game: XGBoost (depth 4, lr 0.05, 1000 trees) takes `pre_game_prob` as an input feature. Post-hoc `StratifiedCalibrator` with phase-specific isotonic calibrators for Q1-Q2, Q3-Q4, and OT.
+
+**Current test set performance (2023-24):** Brier 0.151, ECE 1.4%, AUC-ROC 0.862
 
 ---
 
@@ -229,9 +234,9 @@ All three databases have indexes on `game_id`, `season`, and `team_id`. SQLite W
 
 **Feature leakage:** Every training row must only contain features derivable from plays at or before that event's timestamp. Enforced with a per-row assertion during dataset construction in Phase 2.
 
-**Calibration:** Three-way split — train → calibrate → validate. `CalibratedClassifierCV(cv='prefit', method='isotonic')` fit on the calibration split only. Never touch the val set during calibration.
+**Calibration:** Three-way split — train → calibrate → validate. `StratifiedCalibrator` uses phase-specific isotonic calibrators. OT calibrator uses val OT rows only (2022-23) — cal OT rows excluded due to era shift in OT home-win rates (~44% in 2015-2022 vs ~64% in 2023-24). Q1-Q4 calibrators never touch val data.
 
-**In-game features:** Use raw foul counts (`home_fouls`, `away_fouls`), not FT rate. No H2H feature.
+**In-game features:** 18 features including live overall FG%, 2PT%, 3PT%, and FT% for each team (computed from the PBP stream, zero-filled until first attempt). Raw foul counts (`home_fouls`, `away_fouls`), not FT rate. No H2H feature.
 
 **Event deduplication:** During live polling, deduplicate on `event_id` from `PlayByPlayV3`, not positional index. The API can reorder events in the buffer.
 

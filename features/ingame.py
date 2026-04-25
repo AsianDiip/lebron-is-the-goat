@@ -113,9 +113,24 @@ def _compute_game_features(
     home_to_used = np.zeros(n, dtype=np.int32)
     away_to_used = np.zeros(n, dtype=np.int32)
     last_5_swing = np.zeros(n, dtype=np.int32)
+    home_2pm_arr = np.zeros(n, dtype=np.int32)
+    home_2pa_arr = np.zeros(n, dtype=np.int32)
+    away_2pm_arr = np.zeros(n, dtype=np.int32)
+    away_2pa_arr = np.zeros(n, dtype=np.int32)
+    home_3pm_arr = np.zeros(n, dtype=np.int32)
+    home_3pa_arr = np.zeros(n, dtype=np.int32)
+    away_3pm_arr = np.zeros(n, dtype=np.int32)
+    away_3pa_arr = np.zeros(n, dtype=np.int32)
+    home_ftm_arr = np.zeros(n, dtype=np.int32)
+    home_fta_arr = np.zeros(n, dtype=np.int32)
+    away_ftm_arr = np.zeros(n, dtype=np.int32)
+    away_fta_arr = np.zeros(n, dtype=np.int32)
 
     # Running counters
     h_fgm = h_fga = a_fgm = a_fga = 0
+    h_2pm = h_2pa = a_2pm = a_2pa = 0
+    h_3pm = h_3pa = a_3pm = a_3pa = 0
+    h_ftm = h_fta = a_ftm = a_fta = 0
     h_fouls = a_fouls = 0
     h_tov = a_tov = 0
     h_to = a_to = 0  # timeouts used
@@ -157,14 +172,26 @@ def _compute_game_features(
 
         # ---- Field goals ----------------------------------------------------
         if is_field_goal:
+            is_three = action_type == "3pt"
+            made = shot_result.lower() == "made"
             if is_home_event:
                 h_fga += 1
-                if shot_result.lower() == "made":
-                    h_fgm += 1
+                if made: h_fgm += 1
+                if is_three:
+                    h_3pa += 1
+                    if made: h_3pm += 1
+                else:
+                    h_2pa += 1
+                    if made: h_2pm += 1
             elif is_away_event:
                 a_fga += 1
-                if shot_result.lower() == "made":
-                    a_fgm += 1
+                if made: a_fgm += 1
+                if is_three:
+                    a_3pa += 1
+                    if made: a_3pm += 1
+                else:
+                    a_2pa += 1
+                    if made: a_2pm += 1
 
         # ---- Fouls ----------------------------------------------------------
         if action_type == "foul":
@@ -200,6 +227,12 @@ def _compute_game_features(
         away_tov[i]     = a_tov
         home_to_used[i] = h_to
         away_to_used[i] = a_to
+        home_2pm_arr[i] = h_2pm; home_2pa_arr[i] = h_2pa
+        away_2pm_arr[i] = a_2pm; away_2pa_arr[i] = a_2pa
+        home_3pm_arr[i] = h_3pm; home_3pa_arr[i] = h_3pa
+        away_3pm_arr[i] = a_3pm; away_3pa_arr[i] = a_3pa
+        home_ftm_arr[i] = h_ftm; home_fta_arr[i] = h_fta
+        away_ftm_arr[i] = a_ftm; away_fta_arr[i] = a_fta
 
         # ---- Possession state machine ---------------------------------------
         # Infer possession from current event
@@ -225,6 +258,15 @@ def _compute_game_features(
             current_team = away_team_id if current_team == home_team_id else home_team_id
 
         elif action_type == "free throw":
+            # Accumulate FT stats on every attempt (not just last-of-sequence)
+            ft_made = shot_result.lower() == "made"
+            if is_home_event:
+                h_fta += 1
+                if ft_made: h_ftm += 1
+            elif is_away_event:
+                a_fta += 1
+                if ft_made: a_ftm += 1
+
             # Detect last FT; skip technical FTs (no possession change)
             is_technical = "technical" in prev_sub_type.lower() or "technical" in sub_type.lower()
             if _is_last_free_throw(sub_type) and not is_technical:
@@ -263,6 +305,24 @@ def _compute_game_features(
     )
     result["away_fg_pct_live"] = np.divide(
         away_fg_made, away_fg_att, out=np.zeros(n, dtype=np.float64), where=away_fg_att > 0
+    )
+    result["home_2pt_pct_live"] = np.divide(
+        home_2pm_arr, home_2pa_arr, out=np.zeros(n, dtype=np.float64), where=home_2pa_arr > 0
+    )
+    result["away_2pt_pct_live"] = np.divide(
+        away_2pm_arr, away_2pa_arr, out=np.zeros(n, dtype=np.float64), where=away_2pa_arr > 0
+    )
+    result["home_3pt_pct_live"] = np.divide(
+        home_3pm_arr, home_3pa_arr, out=np.zeros(n, dtype=np.float64), where=home_3pa_arr > 0
+    )
+    result["away_3pt_pct_live"] = np.divide(
+        away_3pm_arr, away_3pa_arr, out=np.zeros(n, dtype=np.float64), where=away_3pa_arr > 0
+    )
+    result["home_ft_pct_live"] = np.divide(
+        home_ftm_arr, home_fta_arr, out=np.zeros(n, dtype=np.float64), where=home_fta_arr > 0
+    )
+    result["away_ft_pct_live"] = np.divide(
+        away_ftm_arr, away_fta_arr, out=np.zeros(n, dtype=np.float64), where=away_fta_arr > 0
     )
 
     result["home_fouls"] = home_fouls
@@ -328,8 +388,10 @@ def build_ingame_snapshots(
     Returns:
         DataFrame with columns:
             game_id, season, action_number, score_diff, seconds_remaining,
-            pre_game_prob, home_fg_pct_live, away_fg_pct_live, home_fouls,
-            away_fouls, turnover_diff_live, timeout_remaining_diff,
+            pre_game_prob, home_fg_pct_live, away_fg_pct_live,
+            home_2pt_pct_live, away_2pt_pct_live, home_3pt_pct_live,
+            away_3pt_pct_live, home_ft_pct_live, away_ft_pct_live,
+            home_fouls, away_fouls, turnover_diff_live, timeout_remaining_diff,
             last_5_poss_swing, quarter, clutch_flag, home_win
     """
     games_conn = sqlite3.connect(games_db_path)
@@ -411,6 +473,9 @@ def build_ingame_snapshots(
         "game_id", "season", "action_number",
         "score_diff", "seconds_remaining", "pre_game_prob",
         "home_fg_pct_live", "away_fg_pct_live",
+        "home_2pt_pct_live", "away_2pt_pct_live",
+        "home_3pt_pct_live", "away_3pt_pct_live",
+        "home_ft_pct_live", "away_ft_pct_live",
         "home_fouls", "away_fouls",
         "turnover_diff_live", "timeout_remaining_diff",
         "last_5_poss_swing", "quarter", "clutch_flag", "home_win",

@@ -1,0 +1,51 @@
+============================================================
+Phase 3 — Model Evaluation
+============================================================
+Models loaded.
+Test data loaded → pregame: 1,230 games  ingame: 567,669 events
+
+--- Pre-game model (test set) ---
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/pregame_reliability.png
+
+--- In-game model (test set) ---
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/ingame_reliability.png
+
+--- SHAP feature importance ---
+Computing SHAP values on 50,000 samples...
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/shap_beeswarm.png
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/shap_bar.png
+
+--- Win probability curves ---
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/win_prob_curves.png
+
+--- Per-quarter calibration ---
+
+Per-quarter calibration on test set:
+ quarter  n_events    brier      ece      auc
+       1    136766 0.210259 0.022949 0.728804
+       2    142320 0.178029 0.020646 0.808774
+       3    139929 0.139755 0.019703 0.881006
+       4    145076 0.080212 0.014742 0.959436
+       5      3127 0.160219 0.070951 0.826941
+       6       451 0.142075 0.172626 0.927399
+Saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures/per_quarter_calibration.png
+
+Uncertainty region (Q2/Q3, |score_diff| ≤ 10)  n=176,254  brier=0.2026  ece=0.0197  auc=0.7520
+
+============================================================
+EVALUATION RESULTS
+============================================================
+Model                        Brier      ECE  AUC-ROC   Accuracy
+------------------------------------------------------------
+Pre-game LR                 0.2174   0.0409   0.7042     0.6431
+In-game XGBoost             0.1512   0.0129   0.8618     0.7734
+In-game (Q2/Q3, |diff|≤10)   0.2026   0.0197   0.7520        nan
+============================================================
+
+Target checks:
+  Pre-game  ECE < 4%:     FAIL  (0.0409)
+  In-game   Brier < 0.18: PASS  (0.1512)
+  In-game   ECE < 5%:     PASS  (0.0129)
+  In-game   AUC > 0.80:   PASS  (0.8618)
+
+Figures saved to: /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/eval_figures

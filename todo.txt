@@ -1,0 +1,3 @@
+  python features/pipeline.py
+  python model/train_ingame.py 2>&1 | tee train.log
+  python model/evaluate.py 2>&1 | tee eval.log

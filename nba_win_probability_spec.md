@@ -55,12 +55,15 @@ No H2H (head-to-head) feature. No lineup-lock re-fetch.
 - `score_diff` — home minus away score
 - `seconds_remaining` — total seconds remaining in game (see clock encoding in Section 7)
 - `pre_game_prob` — output of the pre-game LR model; anchors predictions in Q1 when score is near 0
-- `home_fg_pct_live`, `away_fg_pct_live` — live field goal percentage for each team
+- `home_fg_pct_live`, `away_fg_pct_live` — live overall field goal percentage for each team
+- `home_2pt_pct_live`, `away_2pt_pct_live` — live 2-point FG% for each team
+- `home_3pt_pct_live`, `away_3pt_pct_live` — live 3-point FG% for each team
+- `home_ft_pct_live`, `away_ft_pct_live` — live free throw % for each team (all FT attempts, not just last-of-sequence)
 - `home_fouls`, `away_fouls` — raw cumulative foul counts (not FT rate)
 - `turnover_diff_live` — cumulative turnover differential
 - `timeout_remaining_diff` — timeouts remaining, home minus away
 - `last_5_poss_swing` — momentum proxy; net points over last 5 possessions
-- `quarter` — current period (1–4, OT)
+- `quarter` — current period (1–4, OT); index 16 in `INGAME_FEATURES`
 - `clutch_flag` — 1 if Q4 (or OT) and `abs(score_diff) <= 5`
 
 **Training row structure:** Each play-by-play event becomes one training row. Label = 1 if the home team won the game, 0 otherwise.
@@ -77,10 +80,10 @@ No H2H (head-to-head) feature. No lineup-lock re-fetch.
 - Saved to `model/pregame.pkl`
 
 **Stage 2 — In-game model** (`model/train_ingame.py`):
-- XGBoost (`binary:logistic`, 500 trees, depth 6)
-- Input: in-game features listed above, including `pre_game_prob` from Stage 1
-- Post-hoc isotonic calibration on a dedicated calibration split
-- Target: Brier score <0.18, ECE <5%
+- XGBoost (`binary:logistic`, depth 4, lr 0.05, min_child_weight 20, subsample 0.9, reg_alpha 0.1, reg_lambda 5.0, 1000 trees with early stopping)
+- Input: 18 in-game features listed above, including `pre_game_prob` from Stage 1
+- Post-hoc `StratifiedCalibrator`: phase-specific isotonic calibrators for Q1-Q2, Q3-Q4, and OT. OT calibrator fitted on val OT rows only (2022-23) to correct for era shift in OT home-win rates.
+- Target: Brier score <0.18, ECE <5%, AUC-ROC >0.80
 - Saved to `model/ingame.pkl`
 
 **Train/val/test split (by full season — no temporal leakage):**
@@ -90,7 +93,7 @@ No H2H (head-to-head) feature. No lineup-lock re-fetch.
 - Test: 2023–2024 (~1.2K games)
 - Live: 2024–2025 (held out)
 
-**Calibration:** `CalibratedClassifierCV(cv='prefit', method='isotonic')` fitted on a dedicated calibration split — never on the validation split. Three-way split: train → calibrate → validate.
+**Calibration:** Three-way split: train → calibrate → validate. The in-game model uses `StratifiedCalibrator` with three phase-specific isotonic calibrators. OT calibrator uses val OT rows only (cal OT excluded — era shift in OT home-win rates: ~44% in 2015-2022 vs ~64% in 2023-24). Q1-Q4 calibrators never touch val data.
 
 **Validation checks:**
 - Reliability diagram: when model says 70%, home team should win ~70% of the time
@@ -229,7 +232,7 @@ class Poller:
 
 - `features/elo.py`: walk-forward ELO (K=100, regress to mean each season start)
 - `features/pregame.py`: ELO diff, rolling team stats (eFG%, ORtg, DRtg, AST%, TOV%), rest days, prev season win pct
-- `features/ingame.py`: score diff, seconds remaining, live FG%, foul counts, timeout diff, turnover diff, last_5_poss_swing, clutch_flag
+- `features/ingame.py`: score diff, seconds remaining, live FG%/2PT%/3PT%/FT%, foul counts, timeout diff, turnover diff, last_5_poss_swing, clutch_flag
 - Build training dataset: one row per play event, labeled with final game outcome
 - **Leakage test:** per-row assertion that no feature uses data from plays after the event timestamp
 - Output: `pregame_features.parquet`, `ingame_snapshots.parquet`

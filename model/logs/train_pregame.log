@@ -1,0 +1,16 @@
+============================================================
+Phase 3 — Pre-game model training
+============================================================
+Loaded pregame features: 11,974 rows
+Split → train: 8,289  val: 1,230  test: 1,230  holdout: 1,225
+Calibration carve → train_proper: 7,046 games  calibration: 1,243 games
+Base LR trained.
+Platt calibration fitted on calibration split.
+[VAL]  accuracy=0.6171  brier=0.2297  ece=0.0261  auc=0.6423
+[TEST]  accuracy=0.6431  brier=0.2174  ece=0.0409  auc=0.7042
+Cross-val predictions for 8,289 training games done.
+pre_game_prob generated for 11,974 games  (mean=0.5683)
+Model saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/model/pregame.pkl
+Probabilities saved → /Users/chen/cs-stuff/ml-accelerator/lebron-is-the-goat/data/processed/pregame_probs.parquet
+
+Done. Target metrics: accuracy ~66%, ECE <4%, AUC-ROC >0.78

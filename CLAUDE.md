@@ -13,9 +13,9 @@ These supersede any conflicts between `nba_win_prob_architecture_v2.md` and olde
 - **Season range:** 2015–2025 (~13K games). `SEASONS` in all fetch scripts must cover 2015-16 through 2024-25.
 - **Train/val/test split:** Train 2015–2022, Val 2022–2023 (full season), Test 2023–2024 (full season), Live 2024–2025 held out.
 - **Model architecture:** Two-stage. Separate calibrated LR pre-game model outputs `pre_game_prob`, which is passed as a feature into the XGBoost in-game model. Two training scripts: `model/train_pregame.py` and `model/train_ingame.py`.
-- **Calibration split:** Three-way: train → separate calibration split → validate. Never fit the calibrator on the validation split. Use `cv='prefit'` with isotonic regression.
+- **Calibration split:** Three-way: train → separate calibration split → validate. The in-game model uses a `StratifiedCalibrator` (defined in `model/train_ingame.py`) with three phase-specific isotonic calibrators: Q1-Q2, Q3-Q4, and OT. The OT calibrator is fitted on val OT rows (2022-23) only — cal OT rows (2015-2022) are excluded because their ~44% home win rate dilutes the calibration toward the wrong base rate vs test (~64%). This is a deliberate design exception to address era shift in OT home-win rates. Q1-Q4 calibrators never touch val data.
 - **Pre-game features:** `elo_diff`, `efg_pct_diff`, `ortg_diff`, `drtg_diff`, `prev_season_win_pct_diff`, `rest_days_diff`, `home_flag`, `ast_pct_diff`, `tov_pct_diff`. No H2H feature.
-- **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate.
+- **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_2pt_pct_live`, `away_2pt_pct_live`, `home_3pt_pct_live`, `away_3pt_pct_live`, `home_ft_pct_live`, `away_ft_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate. `quarter` is at index 16 in `INGAME_FEATURES` (`StratifiedCalibrator.QUARTER_IDX = 16`).
 - **Live polling:** `PlayByPlayV3` (not V2) every 30 seconds. Deduplicate by `event_id`, not positional index.
 - **Model artifacts:** `model/pregame.pkl` and `model/ingame.pkl`, serialized with `joblib`.
 - **Rolling stats (eFG%, AST rate, TOV rate):** Computed season-to-date from `player_box_scores` using `cumsum().shift(1)` within each (team, season) group — this excludes the current game. ORtg and DRtg use previous-season values from `team_efficiency` (true per-possession ratings can't be derived from box scores alone). First game of a season falls back to the prior season's full values; 2015-16 game 1 uses league averages.
@@ -27,7 +27,7 @@ These supersede any conflicts between `nba_win_prob_architecture_v2.md` and olde
 
 ## Commands
 
-Phase 1 and Phase 2 are implemented. Phases 3–5 are not yet implemented.
+Phases 1–3 are implemented. Phases 4–5 are not yet implemented.
 
 ```bash
 # Data collection (run once, takes hours — batches and caches aggressively)
@@ -39,11 +39,12 @@ python data/fetch_players.py
 python features/pipeline.py
 
 # Training (two-stage: pre-game first, then in-game)
-python model/train_pregame.py
-python model/train_ingame.py
+python model/train_pregame.py      # outputs model/pregame.pkl + data/processed/pregame_probs.parquet
+python model/train_ingame.py       # requires pregame_probs.parquet; outputs model/ingame.pkl
+python model/train_ingame.py --sweep  # optional: 2-stage hyperparameter search (~2 hrs)
 
 # Evaluation
-python model/evaluate.py
+python model/evaluate.py           # saves figures to model/eval_figures/ (created at runtime)
 
 # Live inference (provide a game_id)
 python live/poller.py --game_id <GAME_ID>
@@ -60,12 +61,13 @@ The system has five layers: data → features → model → live inference → d
 
 **Feature layer** (`features/`) — Two feature classes concatenated at inference time:
 - `pregame.py` computes static features once before tip-off (ELO, rolling team stats, rest days, `ast_pct_diff`, `tov_pct_diff`, `prev_season_win_pct_diff`). Frozen at tip-off — no lineup-lock re-fetch.
-- `ingame.py` updates after every play event (score diff, time remaining, `last_5_poss_swing`, foul counts, timeout diff, live FG%, `clutch_flag`).
+- `ingame.py` updates after every play event (score diff, time remaining, `last_5_poss_swing`, foul counts, timeout diff, live FG%/2PT%/3PT%/FT%, `clutch_flag`).
 - `pipeline.py` concatenates both into a single vector for the in-game model.
 
 **Model layer** (`model/`) — Two-stage:
 1. `train_pregame.py`: scikit-learn `LogisticRegression` + `CalibratedClassifierCV` (Platt scaling). Outputs `pre_game_prob`.
-2. `train_ingame.py`: XGBoost (`binary:logistic`, 500 trees, depth 6) takes `pre_game_prob` as an input feature. Post-hoc isotonic calibration on a separate calibration split (never on val). Both saved with `joblib`.
+2. `train_ingame.py`: XGBoost (`binary:logistic`, best params from sweep: depth 4, lr 0.05, min_child_weight 20, subsample 0.9, reg_alpha 0.1, reg_lambda 5.0, 1000 trees with early stopping) takes `pre_game_prob` as an input feature. Post-hoc stratified isotonic calibration via `StratifiedCalibrator`. Both saved with `joblib`.
+- **Intermediate artifact:** `data/processed/pregame_probs.parquet` — `[game_id, pre_game_prob]` for all ~11,974 games. Training games use out-of-fold (`cross_val_predict`) predictions to avoid leakage into the in-game model; val/test/holdout use the calibrated model directly.
 
 **Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). `Poller` hits `PlayByPlayV3` every 30 seconds and deduplicates by `event_id` (not positional index — the API can reorder the buffer).
 
@@ -74,7 +76,7 @@ The system has five layers: data → features → model → live inference → d
 ## Key constraints
 
 - **Clock encoding:** `time_remaining_game = (4 - period) * 720 + clock_seconds` for regulation. OT periods are 300 seconds (not 720) and must be handled separately or the feature is garbage in OT games.
-- **Calibration split:** train → calibrate → validate are three distinct data splits. Never fit the calibrator on validation data.
+- **Calibration split:** train → calibrate → validate are three distinct data splits. The OT isotonic calibrator is the one exception: it uses val OT rows only (cal OT rows excluded — era shift). Q1-Q4 calibrators never use val data.
 - **Leakage:** every training row must only contain features derivable from plays at or before that event's clock timestamp. Enforce with a per-row assertion during dataset construction.
 - **Logging:** write to the probability CSV on new events only, not on every poll cycle.
 - **Model persistence:** use `joblib`, not `pickle`.
