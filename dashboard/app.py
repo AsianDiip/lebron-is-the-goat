@@ -162,53 +162,102 @@ def plot_probability_curve(
     away_team: str,
     title: str = "",
 ) -> plt.Figure:
-    """Build a matplotlib probability curve with quarter markers and annotations."""
-    fig, ax = plt.subplots(figsize=(12, 5))
+    """Build an ESPN-style probability curve with filled regions and quarter markers."""
+    # ── ESPN-style team colors (fallback: blue/orange) ──
+    TEAM_COLORS = {
+        "ATL": "#E03A3E", "BOS": "#007A33", "BKN": "#000000", "CHA": "#1D1160",
+        "CHI": "#CE1141", "CLE": "#860038", "DAL": "#00538C", "DEN": "#0E2240",
+        "DET": "#C8102E", "GSW": "#1D428A", "HOU": "#CE1141", "IND": "#002D62",
+        "LAC": "#C8102E", "LAL": "#552583", "MEM": "#5D76A9", "MIA": "#98002E",
+        "MIL": "#00471B", "MIN": "#0C2340", "NOP": "#0C2340", "NYK": "#006BB6",
+        "OKC": "#007AC1", "ORL": "#0077C0", "PHI": "#006BB6", "PHX": "#1D1160",
+        "POR": "#E03A3E", "SAC": "#5A2D81", "SAS": "#C4CED4", "TOR": "#CE1141",
+        "UTA": "#002B5C", "WAS": "#002B5C",
+    }
+    home_color = TEAM_COLORS.get(home_team, "#1f77b4")
+    away_color = TEAM_COLORS.get(away_team, "#ff7f0e")
+
+    fig, ax = plt.subplots(figsize=(12, 5), facecolor="white")
+    ax.set_facecolor("#f9f9f9")
 
     secs = df["seconds_remaining"].values
     probs = df["home_win_prob"].values
+    # Convert probability to ESPN-style y-axis: home team at top, away at bottom
+    # ESPN shows: 100% (top, home) -> 50% (middle) -> 100% (bottom, away)
+    # Map: home_prob 1.0 -> y=0 (top), 0.5 -> y=50, 0.0 -> y=100 (bottom)
+    y_espn = (1 - probs) * 100
 
-    # Main probability line
-    ax.plot(secs, probs, lw=1.8, color="#1f77b4", zorder=3)
+    # ── Toss-up band (light shading around 50%) ──
+    ax.axhspan(35, 65, color="#e8edf2", alpha=0.5, zorder=0)
 
-    # 50% reference line
-    ax.axhline(0.5, color="gray", linestyle="--", lw=0.8, alpha=0.5)
+    # ── Filled regions ──
+    ax.fill_between(secs, y_espn, 50, where=y_espn <= 50,
+                    interpolate=True, alpha=0.25, color=home_color, zorder=2)
+    ax.fill_between(secs, y_espn, 50, where=y_espn >= 50,
+                    interpolate=True, alpha=0.25, color=away_color, zorder=2)
 
-    # Quarter boundaries
-    quarter_secs = {"Q1/Q2": 2160, "Q2/Q3": 1440, "Q3/Q4": 720, "End": 0}
-    for label, sec in quarter_secs.items():
+    # ── Probability line ──
+    ax.plot(secs, y_espn, lw=2, color=home_color, zorder=3)
+
+    # ── 50% midline ──
+    ax.axhline(50, color="#b0b0b0", linestyle="-", lw=0.8, zorder=1)
+
+    # ── Quarter boundaries ──
+    quarter_secs = [2160, 1440, 720, 0]
+    for sec in quarter_secs:
         if sec >= secs.min():
-            ax.axvline(sec, color="lightgray", lw=1, alpha=0.7, zorder=1)
+            ax.axvline(sec, color="#d0d0d0", lw=0.8, zorder=1)
 
-    # Quarter labels
-    quarter_centers = [
-        ("Q1", 2520), ("Q2", 1800), ("Q3", 1080), ("Q4", 360),
-    ]
-    for qlabel, center in quarter_centers:
+    # Quarter labels centered
+    quarter_labels = [("1st", 2520), ("2nd", 1800), ("3rd", 1080), ("4th", 360)]
+    for qlabel, center in quarter_labels:
         if center >= secs.min():
-            ax.text(center, 0.97, qlabel, ha="center", va="top",
-                    fontsize=9, color="gray", alpha=0.6)
+            ax.text(center, 2, qlabel, ha="center", va="top",
+                    fontsize=10, color="#888", fontweight="medium")
 
-    # OT shading
+    # OT label
     if secs.min() < 0:
-        ax.axvspan(secs.min() - 10, 0, alpha=0.07, color="orange", zorder=0)
-        ax.text(secs.min() / 2, 0.97, "OT", ha="center", va="top",
-                fontsize=9, color="orange", alpha=0.8)
+        ax.axvline(0, color="#d0d0d0", lw=0.8, zorder=1)
+        ax.text(secs.min() / 2, 2, "OT", ha="center", va="top",
+                fontsize=10, color="#c77600", fontweight="medium")
 
-    # Key play annotations — top 5 momentum swings
+    # ── Team names at corners (ESPN-style) ──
+    ax.text(0.01, 0.02, f"{home_team}", transform=ax.transAxes,
+            fontsize=13, fontweight="bold", color=home_color, va="bottom")
+    ax.text(0.01, 0.98, f"{away_team}", transform=ax.transAxes,
+            fontsize=13, fontweight="bold", color=away_color, va="top")
+
+    # ── Y-axis: percentage labels on both sides ──
+    ax.set_ylim(100, 0)  # Inverted: 0% at top (home certain), 100% at bottom (away certain)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.set_yticklabels(["100%", "75%", "", "75%", "100%"], fontsize=9, color="#888")
+    ax.tick_params(axis="y", length=0)
+
+    # ── X-axis: clean, no raw seconds ──
+    ax.set_xlim(max(secs.max(), 2880) + 30, secs.min() - 30)
+    ax.set_xticks([])
+
+    # ── Spines ──
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    ax.set_title(title or f"{away_team} @ {home_team}", fontsize=13,
+                 fontweight="bold", pad=15, color="#333")
+
+    # ── Key play annotations — top 5 momentum swings ──
     if len(probs) > 1:
         deltas = np.abs(np.diff(probs))
         n_annot = min(5, len(deltas))
         top_idx = np.argsort(deltas)[-n_annot:]
         for idx in top_idx:
             desc = str(df.iloc[idx + 1]["description"])[:35]
-            prob_val = probs[idx + 1]
+            y_val = y_espn[idx + 1]
             sec_val = secs[idx + 1]
-            y_offset = 0.06 if prob_val < 0.5 else -0.06
+            y_offset = -5 if y_val > 50 else 5
             ax.annotate(
                 desc,
-                xy=(sec_val, prob_val),
-                xytext=(sec_val, prob_val + y_offset),
+                xy=(sec_val, y_val),
+                xytext=(sec_val, y_val + y_offset),
                 fontsize=6.5,
                 color="#d62728",
                 alpha=0.85,
@@ -217,17 +266,6 @@ def plot_probability_curve(
                 va="bottom" if y_offset > 0 else "top",
                 zorder=5,
             )
-
-    ax.set_xlim(max(secs.max(), 2880) + 30, secs.min() - 30)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel("Seconds Remaining", fontsize=10)
-    ax.set_ylabel(f"{home_team} Win Probability", fontsize=10)
-    ax.set_title(title or f"{away_team} @ {home_team}", fontsize=12)
-    ax.grid(alpha=0.2)
-    ax.fill_between(secs, probs, 0.5, where=probs >= 0.5,
-                    alpha=0.08, color="#1f77b4", zorder=2)
-    ax.fill_between(secs, probs, 0.5, where=probs < 0.5,
-                    alpha=0.08, color="#ff7f0e", zorder=2)
 
     plt.tight_layout()
     return fig

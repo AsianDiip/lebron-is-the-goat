@@ -64,7 +64,8 @@ def ingame_df() -> pd.DataFrame:
 def elo_ratings() -> dict:
     if not GAMES_DB.exists():
         pytest.skip("games.db not found.")
-    return compute_elo_ratings(GAMES_DB)
+    ratings, _ = compute_elo_ratings(GAMES_DB)
+    return ratings
 
 
 @pytest.fixture(scope="session")
@@ -371,6 +372,7 @@ class TestDataIntegrity:
         expected = {
             "2015-16", "2016-17", "2017-18", "2018-19", "2019-20",
             "2020-21", "2021-22", "2022-23", "2023-24", "2024-25",
+            "2025-26",
         }
         found = set(pregame_df["season"].unique())
         missing = expected - found

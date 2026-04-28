@@ -30,13 +30,11 @@ def _expected_win(team_elo: float, opponent_elo: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((opponent_elo - team_elo) / 400.0))
 
 
-def compute_elo_ratings(games_db_path: Path) -> dict[tuple[int, str], float]:
+def compute_elo_ratings(
+    games_db_path: Path,
+) -> tuple[dict[tuple[int, str], float], dict[int, float]]:
     """
     Walk-forward ELO computation over all seasons in games.db.
-
-    Returns a dict mapping (team_id, game_id) -> elo_before_game.
-    The ELO stored is the rating that team had *entering* that game, so it
-    can be used as a feature without any lookahead.
 
     Algorithm:
       1. Load all game_logs sorted by (game_date, game_id) — deterministic order.
@@ -50,7 +48,10 @@ def compute_elo_ratings(games_db_path: Path) -> dict[tuple[int, str], float]:
         games_db_path: Path to games.db (must contain game_logs table).
 
     Returns:
-        dict[(team_id, game_id), float] — ELO entering each game.
+        Tuple of:
+          - dict[(team_id, game_id), float] — ELO entering each game.
+          - dict[team_id, float] — Current (latest) ELO for each team after
+            all games have been processed. Useful for live inference.
     """
     conn = sqlite3.connect(games_db_path)
     rows = conn.execute(
@@ -126,4 +127,4 @@ def compute_elo_ratings(games_db_path: Path) -> dict[tuple[int, str], float]:
 
         i = j
 
-    return result
+    return result, dict(elo)

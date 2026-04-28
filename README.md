@@ -16,7 +16,7 @@ Data → Features → Model → Live Inference → Dashboard
 
 | Layer | Location | Description |
 |---|---|---|
-| Data | `data/` | Fetch 2015–2025 game logs, team stats, and play-by-play from the NBA Stats API into SQLite |
+| Data | `data/` | Fetch 2015–2026 game logs, team stats, and play-by-play from the NBA Stats API into SQLite |
 | Features | `features/` | Pre-game features (ELO, rolling stats, rest days) + in-game features (score diff, momentum, live FG%/2PT%/3PT%/FT%, fouls, clutch flag) |
 | Model | `model/` | Two-stage: calibrated LR pre-game model → XGBoost in-game model with isotonic calibration |
 | Live inference | `live/` | Polling loop that updates win probability after every play event |
@@ -50,7 +50,7 @@ Python 3.11+ required. No NBA API key needed — the `nba_api` package uses the 
 
 ### Phase 1 — Data Collection
 
-Fetches 10 seasons (2015-16 through 2024-25) of game logs, team efficiency stats, player box scores, and play-by-play events. Data is stored in SQLite under `data/raw/`. All modules check local cache before hitting the API, so reruns skip already-fetched data.
+Fetches 11 seasons (2015-16 through 2025-26) of game logs, team efficiency stats, player box scores, and play-by-play events. Data is stored in SQLite under `data/raw/`. All modules check local cache before hitting the API, so reruns skip already-fetched data.
 
 **Step 1: Game logs and team efficiency stats** (~20 API calls, completes in seconds)
 
@@ -135,7 +135,7 @@ python model/train_ingame.py --sweep  # optional: 2-stage hyperparameter search 
 python model/evaluate.py           # saves figures to model/eval_figures/
 ```
 
-Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 2023–2024, Live 2024–2025 held out.
+Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 2023–2024, Live 2024–2025 and 2025–2026 held out.
 
 **Two-stage architecture:**
 - Pre-game: calibrated Logistic Regression (Platt scaling) outputs `pre_game_prob`
@@ -147,21 +147,33 @@ Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 20
 
 ### Phase 4 — Live Inference
 
+All commands must be run from the project root directory.
+
 ```bash
-# Replay a historical game from pbp.db
-python live/poller.py --game_id 0022301234 --replay
+# Find today's game IDs
+python3 -c "
+from nba_api.live.nba.endpoints import scoreboard
+sb = scoreboard.ScoreBoard()
+for g in sb.get_dict()['scoreboard']['games']:
+    print(g['gameId'], g['awayTeam']['teamTricode'], '@', g['homeTeam']['teamTricode'], g['gameStatusText'])
+"
 
-# Poll a live game (PlayByPlayV3 every 30 seconds)
-python live/poller.py --game_id 0022401234
-
-# Start the FastAPI server
+# Start the FastAPI server (required for dashboard live mode)
 uvicorn live.api:app --reload
+
+# CLI: poll a live game (prints to stdout + logs to live/{game_id}_probability.csv)
+python live/poller.py --game_id 0042500115
+
+# CLI: replay a completed historical game from pbp.db
+python live/poller.py --game_id 0022301234 --replay
 ```
 
 **Components:**
-- `live/game_state.py` — `GameState` class: tracks all mutable in-game state incrementally, produces the 18-element feature vector. Deduplicates by `action_id`.
-- `live/poller.py` — Polling loop with two modes: live (API) and replay (SQLite). Logs `[timestamp, period, clock, event, home_win_prob]` to `live/{game_id}_probability.csv`.
-- `live/api.py` — FastAPI with `GET /pregame/{game_id}` and `GET /live/{game_id}`. Background polling task per game.
+- `live/game_state.py` — `GameState` class: tracks all mutable in-game state incrementally, produces the 18-element feature vector. Deduplicates by `actionNumber` (mapped to `actionId`).
+- `live/poller.py` — Two polling modes: live (uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay`) and replay (reads from SQLite `pbp.db`). Logs `[timestamp, period, clock, event, home_win_prob]` to `live/{game_id}_probability.csv`.
+- `live/api.py` — FastAPI with `GET /pregame/{game_id}` and `GET /live/{game_id}`. Starts a background polling task per game on first request.
+
+**Note:** The stats API `PlayByPlayV3` returns 0 rows for in-progress games. Live polling uses the NBA live endpoint instead. `PlayByPlayV3` is only used for historical replay.
 
 ---
 
@@ -176,7 +188,7 @@ Three modes:
 - **Live** — Enter a game ID to track a live game via the FastAPI server. Auto-refreshes every ~10 seconds.
 - **Backtest Report** — Evaluation figures (reliability diagrams, SHAP, per-quarter calibration) and metrics summary.
 
-**Latency note:** Streamlit is not a true push model. In live mode, the API polls `PlayByPlayV3` every 30 seconds and the dashboard refreshes every ~10 seconds, giving up to ~40 seconds total latency from play to display.
+**Latency note:** Streamlit is not a true push model. In live mode, the API polls the NBA live endpoint every 30 seconds and the dashboard refreshes every ~10 seconds, giving up to ~40 seconds total latency from play to display.
 
 ---
 
@@ -236,9 +248,10 @@ All three databases have indexes on `game_id`, `season`, and `team_id`. SQLite W
 
 **Two-stage model:** The pre-game LR model outputs `pre_game_prob`, which is passed as an explicit input feature to the in-game XGBoost model. This anchors predictions in Q1 when the score is still near 0-0. Train `train_pregame.py` before `train_ingame.py`.
 
-**Season range:** 10 seasons (2015-16 through 2024-25). Train on 2015–2022, calibrate on a dedicated split, validate on 2022–2023, test on 2023–2024. 2024–2025 is held out for live demo.
+**Season range:** 11 seasons (2015-16 through 2025-26). Train on 2015–2022, calibrate on a dedicated split, validate on 2022–2023, test on 2023–2024. 2024–2025 and 2025–2026 are held out.
 
-**API version:** Use `PlayByPlayV3` and `BoxScoreTraditionalV3` throughout. V2 endpoints are deprecated. V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
+**API version:** Use `BoxScoreTraditionalV3` for box scores. For live games use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` — the stats API `PlayByPlayV3` returns 0 rows for in-progress games. V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
+
 
 **Rate limiting:** All API calls during data collection use `time.sleep(0.6)` between requests. Live polling uses 30-second intervals.
 
@@ -250,6 +263,6 @@ All three databases have indexes on `game_id`, `season`, and `team_id`. SQLite W
 
 **In-game features:** 18 features including live overall FG%, 2PT%, 3PT%, and FT% for each team (computed from the PBP stream, zero-filled until first attempt). Raw foul counts (`home_fouls`, `away_fouls`), not FT rate. No H2H feature.
 
-**Event deduplication:** During live polling, deduplicate on `event_id` from `PlayByPlayV3`, not positional index. The API can reorder events in the buffer.
+**Event deduplication:** During live polling, deduplicate on `actionNumber` (mapped to `actionId` in `GameState`). The live API has no `actionId` field. The stats API can reorder events in the buffer.
 
 **Model persistence:** `joblib.dump()` / `joblib.load()` — not `pickle`. Artifacts: `model/pregame.pkl` and `model/ingame.pkl`.

@@ -60,7 +60,7 @@ def run() -> None:
     print("=" * 60)
     print("Step 1/3 — Computing walk-forward ELO ratings")
     print("=" * 60)
-    elo_ratings = compute_elo_ratings(GAMES_DB)
+    elo_ratings, _ = compute_elo_ratings(GAMES_DB)
     print(f"  ELO ratings computed for {len(elo_ratings):,} (team, game) pairs.\n")
 
     # ------------------------------------------------------------------

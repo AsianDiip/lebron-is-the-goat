@@ -25,14 +25,15 @@ Five layers run in sequence during training, then loop continuously during live 
 
 All historical data comes from the NBA Stats API via the `nba_api` Python package. No API key required. Rate-limit all calls with `time.sleep(0.6)` between requests.
 
-**Target seasons:** 2015-16 through 2024-25 (~13K games)
+**Target seasons:** 2015-16 through 2025-26 (~13K+ games)
 
 | Data type | nba_api endpoint | Key fields |
 |---|---|---|
 | Game logs | `LeagueGameLog` | game_id, date, home/away, W/L, scores |
 | Team efficiency | `LeagueDashTeamStats` (Advanced) | OffRtg, DefRtg, Pace, eFG%, TOV%, OREB%, AST% |
 | Player box scores | `BoxScoreTraditionalV3` | PTS, AST, REB, STL, BLK, TOV, FG%, TS% |
-| Play-by-play | `PlayByPlayV3` | event_type, score, clock, period, team |
+| Play-by-play (historical) | `PlayByPlayV3` | event_type, score, clock, period, team |
+| Play-by-play (live) | `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` | event_type, score, clock, period, team |
 
 **Storage:** SQLite for raw fetched data (`data/raw/*.db`) with indexes on `game_id`, `season`, and `team_id`. Parquet for final processed feature matrices (`data/processed/*.parquet`).
 
@@ -91,7 +92,7 @@ No H2H (head-to-head) feature. No lineup-lock re-fetch.
 - Calibration: separate split carved from training data (never the val set)
 - Val: 2022–2023 (~1.2K games)
 - Test: 2023–2024 (~1.2K games)
-- Live: 2024–2025 (held out)
+- Live: 2024–2025 and 2025–2026 (held out)
 
 **Calibration:** Three-way split: train → calibrate → validate. The in-game model uses `StratifiedCalibrator` with three phase-specific isotonic calibrators. OT calibrator uses val OT rows only (cal OT excluded — era shift in OT home-win rates: ~44% in 2015-2022 vs ~64% in 2023-24). Q1-Q4 calibrators never touch val data.
 
@@ -110,8 +111,9 @@ Polling loop that runs during a live game:
 
 ```
 every 30 seconds:
-  1. Poll PlayByPlayV3 for new events since last check
-  2. Deduplicate new events by event_id (not index — API may reorder buffer)
+  1. Poll nba_api.live.nba.endpoints.playbyplay.PlayByPlay for new events
+     (NOTE: stats API PlayByPlayV3 returns 0 rows for in-progress games)
+  2. Deduplicate new events by actionNumber (mapped to actionId — live API has no actionId field)
   3. For each new event:
      a. Update in-game state object (score, clock, fouls, timeouts, turnovers)
      b. Recompute in-game feature vector
@@ -215,7 +217,7 @@ class Poller:
 
 **Goal:** Clean, queryable dataset of historical games and play-by-play events.
 
-- Pull 10 seasons of game logs (2015-16 through 2024-25) via `LeagueGameLog`
+- Pull 11 seasons of game logs (2015-16 through 2025-26) via `LeagueGameLog`
 - Pull team efficiency stats (Advanced) per season via `LeagueDashTeamStats`
 - Pull player box scores via `BoxScoreTraditionalV3` for all games
 - Pull play-by-play for all games via `PlayByPlayV3` (batch and cache aggressively — resumable)
@@ -261,7 +263,7 @@ class Poller:
 **Goal:** Polling loop that emits updated win probability after every live play.
 
 - Implement `GameState` class with `update()` and `to_feature_vector()`
-- Implement `Poller`: polls `PlayByPlayV3` every 30 seconds, deduplicates by `event_id`, updates `GameState`, calls both models in sequence, logs output
+- Implement `Poller`: polls `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` every 30 seconds for live games, deduplicates by `actionNumber`, updates `GameState`, calls both models in sequence, logs output
 - Test against a completed historical game by replaying play-by-play in sequence
 - Handle edge cases: OT (5-minute periods, not 12), API failures, missing clock data
 - Build FastAPI server with `/pregame` and `/live` endpoints
@@ -325,8 +327,8 @@ uvicorn>=0.24.0
 
 **Clock encoding:** Express time remaining as total seconds in the game. For regulation: `time_remaining_game = (4 - period) * 720 + clock_seconds`. OT periods are 300 seconds each and must be handled separately — the formula above produces garbage for OT.
 
-**V3 API:** Use `PlayByPlayV3` and `BoxScoreTraditionalV3` throughout. V2 endpoints are deprecated. V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
+**API endpoints:** Use `BoxScoreTraditionalV3` for box scores. For live in-progress games, use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` — the stats API `PlayByPlayV3` returns 0 rows for live games and is only suitable for completed games (historical replay). V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
 
 **Model persistence:** `joblib.dump()` / `joblib.load()` — not `pickle`. Artifacts are `model/pregame.pkl` and `model/ingame.pkl`.
 
-**Event deduplication:** During live polling, deduplicate on `event_id` from `PlayByPlayV3`, not on positional index. The API can reorder or re-deliver events in the buffer.
+**Event deduplication:** During live polling, deduplicate on `actionNumber` (mapped to `actionId` in `GameState`). The live endpoint has no `actionId` field. The API can reorder or re-deliver events in the buffer.

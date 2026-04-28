@@ -89,35 +89,20 @@ def _ensure_game_state(game_id: str) -> tuple[GameState, float]:
 
 async def _poll_loop(game_id: str, interval: int = 30) -> None:
     """Background polling task for a live game."""
-    from nba_api.stats.endpoints import PlayByPlayV3
+    from live.poller import _fetch_live_actions
 
     state = _active_games[game_id]
     consecutive_empty = 0
 
     while consecutive_empty < 20:
         try:
-            pbp = PlayByPlayV3(game_id=game_id)
-            df = pbp.get_data_frames()[0]
+            actions = await asyncio.to_thread(_fetch_live_actions, game_id)
         except Exception:
             await asyncio.sleep(interval)
             continue
 
         new_count = 0
-        for _, row in df.iterrows():
-            event = {
-                "actionId": row.get("actionId"),
-                "actionNumber": row.get("actionNumber"),
-                "period": row.get("period"),
-                "clock": str(row.get("clock", "") or ""),
-                "teamId": row.get("teamId"),
-                "actionType": str(row.get("actionType", "") or ""),
-                "subType": row.get("subType") or "",
-                "description": row.get("description") or "",
-                "scoreHome": row.get("scoreHome"),
-                "scoreAway": row.get("scoreAway"),
-                "isFieldGoal": row.get("isFieldGoal"),
-                "shotResult": row.get("shotResult") or "",
-            }
+        for event in actions:
             if not state.update(event):
                 continue
             new_count += 1
@@ -151,7 +136,7 @@ def pregame(game_id: str) -> dict:
 
 
 @app.get("/live/{game_id}")
-def live(game_id: str) -> dict:
+async def live(game_id: str) -> dict:
     """
     Return current live probability and game state.
 
@@ -162,8 +147,7 @@ def live(game_id: str) -> dict:
 
     # Start background polling if not already running
     if game_id not in _poll_tasks or _poll_tasks[game_id].done():
-        loop = asyncio.get_event_loop()
-        _poll_tasks[game_id] = loop.create_task(_poll_loop(game_id))
+        _poll_tasks[game_id] = asyncio.ensure_future(_poll_loop(game_id))
 
     return {
         "game_id": game_id,

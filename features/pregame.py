@@ -44,6 +44,7 @@ _SEASON_ORDER = [
     "2014-15",  # only needed as a prior for 2015-16 first game
     "2015-16", "2016-17", "2017-18", "2018-19", "2019-20",
     "2020-21", "2021-22", "2022-23", "2023-24", "2024-25",
+    "2025-26",
 ]
 _PREV_SEASON: dict[str, str] = {
     s: _SEASON_ORDER[i - 1] for i, s in enumerate(_SEASON_ORDER) if i > 0

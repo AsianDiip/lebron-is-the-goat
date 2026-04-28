@@ -10,13 +10,13 @@ NBA real-time win probability model. Full architecture and implementation roadma
 
 These supersede any conflicts between `nba_win_prob_architecture_v2.md` and older notes:
 
-- **Season range:** 2015–2025 (~13K games). `SEASONS` in all fetch scripts must cover 2015-16 through 2024-25.
-- **Train/val/test split:** Train 2015–2022, Val 2022–2023 (full season), Test 2023–2024 (full season), Live 2024–2025 held out.
+- **Season range:** 2015–2026 (~13K+ games). `SEASONS` in all fetch scripts must cover 2015-16 through 2025-26.
+- **Train/val/test split:** Train 2015–2022, Val 2022–2023 (full season), Test 2023–2024 (full season), Live 2024–2025 and 2025–2026 held out.
 - **Model architecture:** Two-stage. Separate calibrated LR pre-game model outputs `pre_game_prob`, which is passed as a feature into the XGBoost in-game model. Two training scripts: `model/train_pregame.py` and `model/train_ingame.py`.
 - **Calibration split:** Three-way: train → separate calibration split → validate. The in-game model uses a `StratifiedCalibrator` (defined in `model/train_ingame.py`) with three phase-specific isotonic calibrators: Q1-Q2, Q3-Q4, and OT. The OT calibrator is fitted on val OT rows (2022-23) only — cal OT rows (2015-2022) are excluded because their ~44% home win rate dilutes the calibration toward the wrong base rate vs test (~64%). This is a deliberate design exception to address era shift in OT home-win rates. Q1-Q4 calibrators never touch val data.
 - **Pre-game features:** `elo_diff`, `efg_pct_diff`, `ortg_diff`, `drtg_diff`, `prev_season_win_pct_diff`, `rest_days_diff`, `home_flag`, `ast_pct_diff`, `tov_pct_diff`. No H2H feature.
 - **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_2pt_pct_live`, `away_2pt_pct_live`, `home_3pt_pct_live`, `away_3pt_pct_live`, `home_ft_pct_live`, `away_ft_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate. `quarter` is at index 16 in `INGAME_FEATURES` (`StratifiedCalibrator.QUARTER_IDX = 16`).
-- **Live polling:** `PlayByPlayV3` (not V2) every 30 seconds. Deduplicate by `event_id`, not positional index.
+- **Live polling:** Use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` for live/in-progress games — the stats API `PlayByPlayV3` returns 0 rows for live games. `PlayByPlayV3` is still used for historical replay from pbp.db. Deduplicate by `actionNumber` (mapped to `actionId`) since the live endpoint has no `actionId` field. Poll every 30 seconds.
 - **Model artifacts:** `model/pregame.pkl` and `model/ingame.pkl`, serialized with `joblib`.
 - **Rolling stats (eFG%, AST rate, TOV rate):** Computed season-to-date from `player_box_scores` using `cumsum().shift(1)` within each (team, season) group — this excludes the current game. ORtg and DRtg use previous-season values from `team_efficiency` (true per-possession ratings can't be derived from box scores alone). First game of a season falls back to the prior season's full values; 2015-16 game 1 uses league averages.
 - **Timeout team identification:** `team_id` is 0 for timeout PBP events. The responsible team is parsed from the `description` field via regex (first token before ` Timeout`), matched case-insensitively against team abbreviations from `game_logs`.
@@ -27,7 +27,7 @@ These supersede any conflicts between `nba_win_prob_architecture_v2.md` and olde
 
 ## Commands
 
-Phases 1–3 are implemented. Phases 4–5 are not yet implemented.
+All phases are implemented.
 
 ```bash
 # Data collection (run once, takes hours — batches and caches aggressively)
@@ -46,10 +46,20 @@ python model/train_ingame.py --sweep  # optional: 2-stage hyperparameter search 
 # Evaluation
 python model/evaluate.py           # saves figures to model/eval_figures/ (created at runtime)
 
-# Live inference (provide a game_id)
-python live/poller.py --game_id <GAME_ID>
+# Find today's live game IDs
+python3 -c "
+from nba_api.live.nba.endpoints import scoreboard
+sb = scoreboard.ScoreBoard()
+for g in sb.get_dict()['scoreboard']['games']:
+    print(g['gameId'], g['awayTeam']['teamTricode'], '@', g['homeTeam']['teamTricode'], g['gameStatusText'])
+"
 
-# Dashboard
+# Live inference — must run from project root
+uvicorn live.api:app --reload          # start FastAPI server (required for dashboard live mode)
+python live/poller.py --game_id <GAME_ID>          # CLI polling (prints to stdout + CSV)
+python live/poller.py --game_id <GAME_ID> --replay  # replay a completed game from pbp.db
+
+# Dashboard — must run from project root
 streamlit run dashboard/app.py
 ```
 
@@ -69,7 +79,7 @@ The system has five layers: data → features → model → live inference → d
 2. `train_ingame.py`: XGBoost (`binary:logistic`, best params from sweep: depth 4, lr 0.05, min_child_weight 20, subsample 0.9, reg_alpha 0.1, reg_lambda 5.0, 1000 trees with early stopping) takes `pre_game_prob` as an input feature. Post-hoc stratified isotonic calibration via `StratifiedCalibrator`. Both saved with `joblib`.
 - **Intermediate artifact:** `data/processed/pregame_probs.parquet` — `[game_id, pre_game_prob]` for all ~11,974 games. Training games use out-of-fold (`cross_val_predict`) predictions to avoid leakage into the in-game model; val/test/holdout use the calibrated model directly.
 
-**Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). `Poller` hits `PlayByPlayV3` every 30 seconds and deduplicates by `event_id` (not positional index — the API can reorder the buffer).
+**Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). For live games, `poller.py` uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` (the stats API `PlayByPlayV3` returns 0 rows for in-progress games). Deduplicates by `actionNumber` mapped to `actionId`. `api.py` is a FastAPI server that manages background polling tasks per game.
 
 **Dashboard** (`dashboard/app.py`) — Streamlit. Uses `st.empty()` + rerun for live updates. Not a true push model; document this limitation if latency matters.
 
