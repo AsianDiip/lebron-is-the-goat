@@ -31,8 +31,8 @@ Data → Features → Model → Live Inference → Dashboard
 | Phase 1 — Data collection | **Complete** | Fetch modules and SQLite storage implemented |
 | Phase 2 — Feature engineering | **Complete** | Pre-game and in-game feature computation |
 | Phase 3 — Model training | **Complete** | Two-stage LR + XGBoost, stratified calibration, evaluation |
-| Phase 4 — Live inference | Not started | Polling loop and GameState class |
-| Phase 5 — Dashboard | Not started | Streamlit probability curve display |
+| Phase 4 — Live inference | **Complete** | GameState, Poller, FastAPI server |
+| Phase 5 — Dashboard | **Complete** | Streamlit replay, live tracking, backtest report |
 
 ---
 
@@ -147,25 +147,36 @@ Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 20
 
 ### Phase 4 — Live Inference
 
-> Not yet implemented.
-
 ```bash
-python live/poller.py --game_id <GAME_ID>
+# Replay a historical game from pbp.db
+python live/poller.py --game_id 0022301234 --replay
+
+# Poll a live game (PlayByPlayV3 every 30 seconds)
+python live/poller.py --game_id 0022401234
+
+# Start the FastAPI server
+uvicorn live.api:app --reload
 ```
 
-Polls `PlayByPlayV3` every 30 seconds, deduplicates events by `event_id`, updates in-memory game state, and logs `[timestamp, period, clock, event, home_win_prob]` to a CSV after each new play.
+**Components:**
+- `live/game_state.py` — `GameState` class: tracks all mutable in-game state incrementally, produces the 18-element feature vector. Deduplicates by `action_id`.
+- `live/poller.py` — Polling loop with two modes: live (API) and replay (SQLite). Logs `[timestamp, period, clock, event, home_win_prob]` to `live/{game_id}_probability.csv`.
+- `live/api.py` — FastAPI with `GET /pregame/{game_id}` and `GET /live/{game_id}`. Background polling task per game.
 
 ---
 
 ### Phase 5 — Dashboard
 
-> Not yet implemented.
-
 ```bash
 streamlit run dashboard/app.py
 ```
 
-Shows the live win probability curve with quarter markers and key play annotations. Uses `st.empty()` + rerun for updates (not a true push model — latency is ~30 seconds).
+Three modes:
+- **Replay** — Select any historical game by season. Full probability curve with quarter markers and key play annotations (top 5 momentum swings).
+- **Live** — Enter a game ID to track a live game via the FastAPI server. Auto-refreshes every ~10 seconds.
+- **Backtest Report** — Evaluation figures (reliability diagrams, SHAP, per-quarter calibration) and metrics summary.
+
+**Latency note:** Streamlit is not a true push model. In live mode, the API polls `PlayByPlayV3` every 30 seconds and the dashboard refreshes every ~10 seconds, giving up to ~40 seconds total latency from play to display.
 
 ---
 
@@ -201,6 +212,7 @@ nba-win-prob/
 │   ├── model_analysis.ipynb
 │   └── replay.ipynb
 ├── tests/
+│   ├── test_game_state.py
 │   └── test_no_leakage.py
 ├── requirements.txt
 └── README.md
