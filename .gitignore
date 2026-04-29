@@ -40,6 +40,13 @@ model/*.pkl
 
 # Environment
 .env
+.env.local
+.env*.local
+
+# Next.js
+web/node_modules/
+web/.next/
+web/out/
 
 # Docs
 CLAUDE.md

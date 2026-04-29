@@ -19,8 +19,8 @@ Data → Features → Model → Live Inference → Dashboard
 | Data | `data/` | Fetch 2015–2026 game logs, team stats, and play-by-play from the NBA Stats API into SQLite |
 | Features | `features/` | Pre-game features (ELO, rolling stats, rest days) + in-game features (score diff, momentum, live FG%/2PT%/3PT%/FT%, fouls, clutch flag) |
 | Model | `model/` | Two-stage: calibrated LR pre-game model → XGBoost in-game model with isotonic calibration |
-| Live inference | `live/` | Polling loop that updates win probability after every play event |
-| Dashboard | `dashboard/` | Streamlit probability curve display |
+| Live inference | `live/` | FastAPI server with REST + WebSocket endpoints, background polling per game |
+| Dashboard | `web/` | Next.js + TypeScript + Tailwind CSS + Recharts |
 
 ---
 
@@ -31,18 +31,48 @@ Data → Features → Model → Live Inference → Dashboard
 | Phase 1 — Data collection | **Complete** | Fetch modules and SQLite storage implemented |
 | Phase 2 — Feature engineering | **Complete** | Pre-game and in-game feature computation |
 | Phase 3 — Model training | **Complete** | Two-stage LR + XGBoost, stratified calibration, evaluation |
-| Phase 4 — Live inference | **Complete** | GameState, Poller, FastAPI server |
-| Phase 5 — Dashboard | **Complete** | Streamlit replay, live tracking, backtest report |
+| Phase 4 — Live inference | **Complete** | GameState, Poller, FastAPI server with WebSocket |
+| Phase 5 — Dashboard | **Complete** | React dashboard with real-time updates, replay, and backtest report |
 
 ---
 
 ## Setup
 
 ```bash
+# Python backend
 pip install -r requirements.txt
+
+# Frontend
+cd web && npm install
 ```
 
-Python 3.11+ required. No NBA API key needed — the `nba_api` package uses the public NBA Stats endpoint.
+Python 3.11+ required. Node.js 18+ required for the frontend. No API keys needed — the `nba_api` package uses the public NBA Stats endpoint.
+
+---
+
+## Quick Start (Live Game)
+
+```bash
+# Terminal 1: Start the API server
+uvicorn live.api:app --reload
+
+# Terminal 2: Start the dashboard
+cd web && npm run dev
+
+# Open http://localhost:3000
+# Enter a game ID to track live, or browse historical games for replay
+```
+
+To find today's game IDs:
+
+```bash
+python3 -c "
+from nba_api.live.nba.endpoints import scoreboard
+sb = scoreboard.ScoreBoard()
+for g in sb.get_dict()['scoreboard']['games']:
+    print(g['gameId'], g['awayTeam']['teamTricode'], '@', g['homeTeam']['teamTricode'], g['gameStatusText'])
+"
+```
 
 ---
 
@@ -100,12 +130,6 @@ python data/fetch_players.py --season 2023-24
 
 **Data validation** runs automatically at the end of `fetch_pbp.py`. It asserts that every game in `game_logs` has corresponding play-by-play and box score rows, and prints a coverage summary. Any inconsistency raises an error rather than silently producing bad training data.
 
-**EDA:**
-
-```bash
-jupyter notebook notebooks/eda.ipynb
-```
-
 ---
 
 ### Phase 2 — Feature Engineering
@@ -150,15 +174,7 @@ Train/val/test split by full season: Train 2015–2022, Val 2022–2023, Test 20
 All commands must be run from the project root directory.
 
 ```bash
-# Find today's game IDs
-python3 -c "
-from nba_api.live.nba.endpoints import scoreboard
-sb = scoreboard.ScoreBoard()
-for g in sb.get_dict()['scoreboard']['games']:
-    print(g['gameId'], g['awayTeam']['teamTricode'], '@', g['homeTeam']['teamTricode'], g['gameStatusText'])
-"
-
-# Start the FastAPI server (required for dashboard live mode)
+# Start the FastAPI server (required for the dashboard)
 uvicorn live.api:app --reload
 
 # CLI: poll a live game (prints to stdout + logs to live/{game_id}_probability.csv)
@@ -171,7 +187,21 @@ python live/poller.py --game_id 0022301234 --replay
 **Components:**
 - `live/game_state.py` — `GameState` class: tracks all mutable in-game state incrementally, produces the 18-element feature vector. Deduplicates by `actionNumber` (mapped to `actionId`).
 - `live/poller.py` — Two polling modes: live (uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay`) and replay (reads from SQLite `pbp.db`). Logs `[timestamp, period, clock, event, home_win_prob]` to `live/{game_id}_probability.csv`.
-- `live/api.py` — FastAPI with `GET /pregame/{game_id}` and `GET /live/{game_id}`. Starts a background polling task per game on first request.
+- `live/api.py` — FastAPI server with REST and WebSocket endpoints.
+
+**API Endpoints:**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/pregame/{game_id}` | GET | Pre-game win probability |
+| `/pregame/{game_id}/breakdown` | GET | Pre-game feature values + human-readable labels |
+| `/live/{game_id}` | GET | Current live state, probability history, play log, and box score |
+| `/games?season=2024-25` | GET | Game list for replay selector |
+| `/replay/{game_id}` | GET | Full server-side replay from pbp.db |
+| `/ws/{game_id}` | WebSocket | Real-time push updates on each poll cycle |
+| `/figures/{filename}` | Static | Evaluation figures from model/eval_figures/ |
+
+The WebSocket endpoint pushes the full game state payload to all connected clients whenever the polling loop processes new events. Poll interval is 15 seconds when WebSocket clients are connected (30 seconds otherwise).
 
 **Note:** The stats API `PlayByPlayV3` returns 0 rows for in-progress games. Live polling uses the NBA live endpoint instead. `PlayByPlayV3` is only used for historical replay.
 
@@ -180,15 +210,31 @@ python live/poller.py --game_id 0022301234 --replay
 ### Phase 5 — Dashboard
 
 ```bash
-streamlit run dashboard/app.py
+# Start the API server first
+uvicorn live.api:app --reload
+
+# Start the Next.js dashboard
+cd web && npm run dev
+# Open http://localhost:3000
 ```
 
-Three modes:
-- **Replay** — Select any historical game by season. Full probability curve with quarter markers and key play annotations (top 5 momentum swings).
-- **Live** — Enter a game ID to track a live game via the FastAPI server. Auto-refreshes every ~10 seconds.
-- **Backtest Report** — Evaluation figures (reliability diagrams, SHAP, per-quarter calibration) and metrics summary.
+**Pages:**
 
-**Latency note:** Streamlit is not a true push model. In live mode, the API polls the NBA live endpoint every 30 seconds and the dashboard refreshes every ~10 seconds, giving up to ~40 seconds total latency from play to display.
+- **Game Selector** (`/`) — Browse historical games by season or enter a live game ID. Click any game to view its replay, or enter a game ID for live tracking.
+- **Game Dashboard** (`/game/[gameId]`) — Full game view with:
+  - **Scoreboard** — Team logos, names in team colors, large score, clock, animated win probability bar
+  - **Win Probability Chart** — ESPN-style Recharts area chart with inverted y-axis, team-colored filled regions, quarter boundaries, toss-up band, and tooltips
+  - **Play-by-Play** (tab) — Scrollable table with Qtr, Clock, Team, Play, Score, Win%
+  - **Box Score** (tab) — Two-column shooting splits (FG/2PT/3PT/FT) with leading-team highlighting
+  - **Key Moments** (tab) — Top 5 momentum swings, lead changes count, largest scoring run
+  - **Pre-Game** (tab) — Diverging bar chart of the 9 pre-game feature contributions
+- **Backtest Report** (`/backtest`) — Metrics table (Brier, ECE, AUC-ROC), pass/fail badges, and evaluation figure grid
+
+**Real-time architecture:** The dashboard connects via WebSocket (`/ws/{game_id}`) for live games. The `useGameWebSocket` hook handles auto-reconnect with exponential backoff and falls back to REST polling (`GET /live/{game_id}` every 5 seconds) if WebSocket fails. For replays, it fetches `GET /replay/{game_id}` once.
+
+**Tech stack:** Next.js 16, TypeScript, Tailwind CSS v4, Recharts. Config: `web/.env.local` sets `NEXT_PUBLIC_API_URL`.
+
+**Legacy:** The Streamlit dashboard (`dashboard/app.py`) still exists but is deprecated. It has a rendering bug where the scoreboard HTML renders as raw text.
 
 ---
 
@@ -211,14 +257,24 @@ nba-win-prob/
 │   ├── train_pregame.py        # Calibrated LR (Platt scaling) → pregame.pkl
 │   ├── train_ingame.py         # XGBoost + isotonic calibration → ingame.pkl
 │   ├── evaluate.py             # Brier, ECE, reliability diagrams, curve plots
+│   ├── eval_figures/           # Generated evaluation plots
 │   ├── pregame.pkl             # Saved pre-game model
 │   └── ingame.pkl              # Saved in-game model
 ├── live/
 │   ├── game_state.py           # GameState class (incremental in-memory state)
-│   ├── poller.py               # PlayByPlayV3 polling loop + probability logging
-│   └── api.py                  # FastAPI server
+│   ├── poller.py               # PlayByPlay polling loop + probability logging
+│   └── api.py                  # FastAPI server (REST + WebSocket)
+├── web/                        # Next.js dashboard
+│   ├── src/
+│   │   ├── app/                # Pages: /, /game/[gameId], /backtest
+│   │   ├── components/         # Scoreboard, WinProbChart, PlayByPlayFeed, BoxScore, etc.
+│   │   ├── hooks/              # useGameWebSocket (WebSocket + REST fallback)
+│   │   ├── lib/                # teamMeta, api client, formatters, momentum detection
+│   │   └── types/              # TypeScript interfaces for API responses
+│   ├── .env.local              # NEXT_PUBLIC_API_URL=http://localhost:8000
+│   └── package.json
 ├── dashboard/
-│   └── app.py                  # Streamlit dashboard
+│   └── app.py                  # Legacy Streamlit dashboard (deprecated)
 ├── notebooks/
 │   ├── eda.ipynb
 │   ├── model_analysis.ipynb
@@ -236,7 +292,7 @@ nba-win-prob/
 
 | Database | Tables | Contents |
 |---|---|---|
-| `data/raw/games.db` | `game_logs`, `team_efficiency` | One row per team per game; season-level Advanced efficiency stats |
+| `data/raw/games.db` | `game_logs`, `team_efficiency` | One row per team per game; season-level advanced efficiency stats |
 | `data/raw/pbp.db` | `play_by_play` | One row per play event; clock parsed to seconds |
 | `data/raw/players.db` | `player_box_scores` | One row per player per game |
 
@@ -252,8 +308,7 @@ All three databases have indexes on `game_id`, `season`, and `team_id`. SQLite W
 
 **API version:** Use `BoxScoreTraditionalV3` for box scores. For live games use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` — the stats API `PlayByPlayV3` returns 0 rows for in-progress games. V3 clock fields use ISO 8601 format (`PT11M42.00S`); column names are camelCase.
 
-
-**Rate limiting:** All API calls during data collection use `time.sleep(0.6)` between requests. Live polling uses 30-second intervals.
+**Rate limiting:** All API calls during data collection use `time.sleep(0.6)` between requests. Live polling uses 30-second intervals (15 seconds when WebSocket clients are connected).
 
 **Clock encoding:** Time remaining is expressed as total seconds in the game, not just the current quarter. For regulation: `time_remaining_game = (4 - period) * 720 + clock_seconds`. OT periods are 300 seconds each and must be handled separately — the formula above is wrong for OT.
 
@@ -266,3 +321,5 @@ All three databases have indexes on `game_id`, `season`, and `team_id`. SQLite W
 **Event deduplication:** During live polling, deduplicate on `actionNumber` (mapped to `actionId` in `GameState`). The live API has no `actionId` field. The stats API can reorder events in the buffer.
 
 **Model persistence:** `joblib.dump()` / `joblib.load()` — not `pickle`. Artifacts: `model/pregame.pkl` and `model/ingame.pkl`.
+
+**StratifiedCalibrator import:** Must be imported before `joblib.load("ingame.pkl")` in any module that loads the in-game model. Both `api.py` and `poller.py` handle this. `api.py` also registers the class on `__main__` for deserialization safety.

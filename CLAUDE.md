@@ -16,7 +16,7 @@ These supersede any conflicts between `nba_win_prob_architecture_v2.md` and olde
 - **Calibration split:** Three-way: train → separate calibration split → validate. The in-game model uses a `StratifiedCalibrator` (defined in `model/train_ingame.py`) with three phase-specific isotonic calibrators: Q1-Q2, Q3-Q4, and OT. The OT calibrator is fitted on val OT rows (2022-23) only — cal OT rows (2015-2022) are excluded because their ~44% home win rate dilutes the calibration toward the wrong base rate vs test (~64%). This is a deliberate design exception to address era shift in OT home-win rates. Q1-Q4 calibrators never touch val data.
 - **Pre-game features:** `elo_diff`, `efg_pct_diff`, `ortg_diff`, `drtg_diff`, `prev_season_win_pct_diff`, `rest_days_diff`, `home_flag`, `ast_pct_diff`, `tov_pct_diff`. No H2H feature.
 - **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_2pt_pct_live`, `away_2pt_pct_live`, `home_3pt_pct_live`, `away_3pt_pct_live`, `home_ft_pct_live`, `away_ft_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate. `quarter` is at index 16 in `INGAME_FEATURES` (`StratifiedCalibrator.QUARTER_IDX = 16`).
-- **Live polling:** Use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` for live/in-progress games — the stats API `PlayByPlayV3` returns 0 rows for live games. `PlayByPlayV3` is still used for historical replay from pbp.db. Deduplicate by `actionNumber` (mapped to `actionId`) since the live endpoint has no `actionId` field. Poll every 30 seconds.
+- **Live polling:** Use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` for live/in-progress games — the stats API `PlayByPlayV3` returns 0 rows for live games. `PlayByPlayV3` is still used for historical replay from pbp.db. Deduplicate by `actionNumber` (mapped to `actionId`) since the live endpoint has no `actionId` field. Poll every 30 seconds (15 seconds when WebSocket clients are connected).
 - **Model artifacts:** `model/pregame.pkl` and `model/ingame.pkl`, serialized with `joblib`.
 - **Rolling stats (eFG%, AST rate, TOV rate):** Computed season-to-date from `player_box_scores` using `cumsum().shift(1)` within each (team, season) group — this excludes the current game. ORtg and DRtg use previous-season values from `team_efficiency` (true per-possession ratings can't be derived from box scores alone). First game of a season falls back to the prior season's full values; 2015-16 game 1 uses league averages.
 - **Timeout team identification:** `team_id` is 0 for timeout PBP events. The responsible team is parsed from the `description` field via regex (first token before ` Timeout`), matched case-insensitively against team abbreviations from `game_logs`.
@@ -55,11 +55,14 @@ for g in sb.get_dict()['scoreboard']['games']:
 "
 
 # Live inference — must run from project root
-uvicorn live.api:app --reload          # start FastAPI server (required for dashboard live mode)
+uvicorn live.api:app --reload          # start FastAPI server (required for dashboard)
 python live/poller.py --game_id <GAME_ID>          # CLI polling (prints to stdout + CSV)
 python live/poller.py --game_id <GAME_ID> --replay  # replay a completed game from pbp.db
 
-# Dashboard — must run from project root
+# React dashboard — must run from project root
+cd web && npm run dev                  # starts Next.js dev server on http://localhost:3000
+
+# Legacy Streamlit dashboard (deprecated, being replaced by web/)
 streamlit run dashboard/app.py
 ```
 
@@ -79,9 +82,47 @@ The system has five layers: data → features → model → live inference → d
 2. `train_ingame.py`: XGBoost (`binary:logistic`, best params from sweep: depth 4, lr 0.05, min_child_weight 20, subsample 0.9, reg_alpha 0.1, reg_lambda 5.0, 1000 trees with early stopping) takes `pre_game_prob` as an input feature. Post-hoc stratified isotonic calibration via `StratifiedCalibrator`. Both saved with `joblib`.
 - **Intermediate artifact:** `data/processed/pregame_probs.parquet` — `[game_id, pre_game_prob]` for all ~11,974 games. Training games use out-of-fold (`cross_val_predict`) predictions to avoid leakage into the in-game model; val/test/holdout use the calibrated model directly.
 
-**Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). For live games, `poller.py` uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` (the stats API `PlayByPlayV3` returns 0 rows for in-progress games). Deduplicates by `actionNumber` mapped to `actionId`. `api.py` is a FastAPI server that manages background polling tasks per game.
+**Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). For live games, `poller.py` uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` (the stats API `PlayByPlayV3` returns 0 rows for in-progress games). Deduplicates by `actionNumber` mapped to `actionId`. `api.py` is a FastAPI server with REST + WebSocket endpoints, managing background polling tasks per game.
 
-**Dashboard** (`dashboard/app.py`) — Streamlit. Uses `st.empty()` + rerun for live updates. Not a true push model; document this limitation if latency matters.
+**Dashboard** (`web/`) — Next.js + TypeScript + Tailwind CSS + Recharts. Connects to the FastAPI server via WebSocket (`/ws/{game_id}`) for real-time updates with REST polling fallback. Dark broadcast-style theme. Components: Scoreboard, WinProbChart, PlayByPlayFeed, BoxScore, MomentumPanel, PregameBreakdown.
+
+**Legacy dashboard** (`dashboard/app.py`) — Streamlit. Deprecated but still functional. Has a rendering bug with HTML/CSS in the scoreboard (displays raw markup). Being replaced by `web/`.
+
+## API Endpoints (live/api.py)
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/pregame/{game_id}` | GET | Pre-game win probability |
+| `/pregame/{game_id}/breakdown` | GET | Pre-game feature values + human-readable labels |
+| `/live/{game_id}` | GET | Current live state + prob_history + play_log + box_score |
+| `/games?season=2024-25` | GET | Game list for replay selector (seasons + games) |
+| `/replay/{game_id}` | GET | Full server-side replay from pbp.db |
+| `/ws/{game_id}` | WebSocket | Real-time push updates (broadcasts on each poll cycle) |
+| `/figures/{filename}` | Static | Evaluation figures from model/eval_figures/ |
+
+The `/live/` and `/replay/` endpoints return the same response shape — the frontend uses identical components for both. The response includes a `box_score` object with per-team shooting stats (FG/2PT/3PT/FT made+attempted+pct, fouls, turnovers, timeouts_remaining), sourced from `GameState` attributes.
+
+## Frontend (web/)
+
+Next.js 16 app router with TypeScript. Key files:
+
+| File | Purpose |
+|---|---|
+| `src/app/page.tsx` | Landing page — game selector (live ID input + historical game browser) |
+| `src/app/game/[gameId]/page.tsx` | Game dashboard — scoreboard, chart, tabbed panels |
+| `src/app/backtest/page.tsx` | Model evaluation report |
+| `src/hooks/useGameWebSocket.ts` | WebSocket hook with auto-reconnect + REST fallback |
+| `src/lib/teamMeta.ts` | Team colors, names, IDs (30 teams), logo URL helper |
+| `src/lib/api.ts` | REST client functions |
+| `src/lib/momentum.ts` | Client-side momentum/runs/lead-change detection |
+| `src/components/Scoreboard.tsx` | Team logos, scores, clock, win probability bar |
+| `src/components/WinProbChart.tsx` | Recharts area chart (ESPN-style, inverted y-axis) |
+| `src/components/PlayByPlayFeed.tsx` | Scrollable play-by-play table |
+| `src/components/BoxScore.tsx` | Two-column shooting splits comparison |
+| `src/components/MomentumPanel.tsx` | Top 5 swings, lead changes, largest run |
+| `src/components/PregameBreakdown.tsx` | Diverging bar chart of pre-game features |
+
+**Dependencies:** `recharts` (charting), `lucide-react` (icons). Config in `web/.env.local`: `NEXT_PUBLIC_API_URL=http://localhost:8000`.
 
 ## Key constraints
 
@@ -90,3 +131,5 @@ The system has five layers: data → features → model → live inference → d
 - **Leakage:** every training row must only contain features derivable from plays at or before that event's clock timestamp. Enforce with a per-row assertion during dataset construction.
 - **Logging:** write to the probability CSV on new events only, not on every poll cycle.
 - **Model persistence:** use `joblib`, not `pickle`.
+- **StratifiedCalibrator import:** Must be imported before `joblib.load("ingame.pkl")` — both `api.py` and `poller.py` handle this. `api.py` also registers it on `__main__` for deserialization safety.
+- **WebSocket lifecycle:** `_ws_connections` tracks clients per game. `_poll_loop` broadcasts to all connected clients after processing new events. Dead connections are pruned on send failure.
