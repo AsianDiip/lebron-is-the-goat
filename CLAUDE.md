@@ -1,135 +1,199 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Instructions for AI coding assistants working in this repository.
 
 ## Project
 
-NBA real-time win probability model. Full architecture and implementation roadmap are in `nba_win_prob_architecture_v2.md` — read it before making any structural decisions.
+NBA real-time win probability model. Outputs a single float (home team win probability, 0.0-1.0) updated after every play-by-play event. Two-stage architecture: calibrated Logistic Regression pre-game model feeds into an XGBoost in-game model. Data sourced from the NBA Stats API via `nba_api`, stored in SQLite, trained on 11 seasons (2015-2026). Live inference via FastAPI + WebSocket, displayed in a Next.js dashboard.
 
-## Resolved design decisions
+## Tech stack
 
-These supersede any conflicts between `nba_win_prob_architecture_v2.md` and older notes:
+| Layer | Technology | Version |
+|---|---|---|
+| ML / data | Python 3.11+, pandas, numpy, XGBoost, scikit-learn, SHAP | see `requirements.txt` |
+| Data storage | SQLite (WAL mode), Parquet | |
+| API server | FastAPI, uvicorn | |
+| Frontend | Next.js 16, React 19, TypeScript 5, Tailwind CSS v4, Recharts 3 | see `web/package.json` |
+| Icons | lucide-react | |
+| Serialization | joblib (not pickle) | |
+| NBA data | nba_api (public, no API key) | |
 
-- **Season range:** 2015–2026 (~13K+ games). `SEASONS` in all fetch scripts must cover 2015-16 through 2025-26.
-- **Train/val/test split:** Train 2015–2022, Val 2022–2023 (full season), Test 2023–2024 (full season), Live 2024–2025 and 2025–2026 held out.
-- **Model architecture:** Two-stage. Separate calibrated LR pre-game model outputs `pre_game_prob`, which is passed as a feature into the XGBoost in-game model. Two training scripts: `model/train_pregame.py` and `model/train_ingame.py`.
-- **Calibration split:** Three-way: train → separate calibration split → validate. The in-game model uses a `StratifiedCalibrator` (defined in `model/train_ingame.py`) with three phase-specific isotonic calibrators: Q1-Q2, Q3-Q4, and OT. The OT calibrator is fitted on val OT rows (2022-23) only — cal OT rows (2015-2022) are excluded because their ~44% home win rate dilutes the calibration toward the wrong base rate vs test (~64%). This is a deliberate design exception to address era shift in OT home-win rates. Q1-Q4 calibrators never touch val data.
-- **Pre-game features:** `elo_diff`, `efg_pct_diff`, `ortg_diff`, `drtg_diff`, `prev_season_win_pct_diff`, `rest_days_diff`, `home_flag`, `ast_pct_diff`, `tov_pct_diff`. No H2H feature.
-- **In-game features:** `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_2pt_pct_live`, `away_2pt_pct_live`, `home_3pt_pct_live`, `away_3pt_pct_live`, `home_ft_pct_live`, `away_ft_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter`, `clutch_flag` (Q4 and `abs(score_diff) <= 5`). Use raw foul counts, not FT rate. `quarter` is at index 16 in `INGAME_FEATURES` (`StratifiedCalibrator.QUARTER_IDX = 16`).
-- **Live polling:** Use `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` for live/in-progress games — the stats API `PlayByPlayV3` returns 0 rows for live games. `PlayByPlayV3` is still used for historical replay from pbp.db. Deduplicate by `actionNumber` (mapped to `actionId`) since the live endpoint has no `actionId` field. Poll every 30 seconds (15 seconds when WebSocket clients are connected).
-- **Model artifacts:** `model/pregame.pkl` and `model/ingame.pkl`, serialized with `joblib`.
-- **Rolling stats (eFG%, AST rate, TOV rate):** Computed season-to-date from `player_box_scores` using `cumsum().shift(1)` within each (team, season) group — this excludes the current game. ORtg and DRtg use previous-season values from `team_efficiency` (true per-possession ratings can't be derived from box scores alone). First game of a season falls back to the prior season's full values; 2015-16 game 1 uses league averages.
-- **Timeout team identification:** `team_id` is 0 for timeout PBP events. The responsible team is parsed from the `description` field via regex (first token before ` Timeout`), matched case-insensitively against team abbreviations from `game_logs`.
-- **Possession identification for `last_5_poss_swing`:** Per-game state machine treating Made Shot, Turnover, last Free Throw in sequence (`"Free Throw N of N"`), and defensive Rebound as possession-ending events. And-1 free throw edge case is a known approximation. Technical FTs are not treated as possession-enders.
-- **Score forward-fill:** PBP `score_home`/`score_away` are NULL on non-scoring events (~60% of rows). Forward-filled with `ffill()` after sorting by `action_number`; initial value is (0, 0).
-- **OT clock encoding:** `seconds_remaining` goes negative for overtime — OT1 runs from 0 to -300, OT2 from -300 to -600, etc. Formula: `-((period - 5) * 300 + (300 - clock_seconds))`. Combined with the raw `quarter` feature, the model can disambiguate end-of-Q4 from start-of-OT.
-- **`pre_game_prob` in in-game features:** Set to `0.5` as a placeholder during feature building. Replaced at training time by `model/train_ingame.py`, which runs the pre-game model over the pregame feature set to generate actual predictions.
+## Repository structure
+
+```
+data/
+  fetch_games.py          # LeagueGameLog + LeagueDashTeamStats -> games.db
+  fetch_pbp.py            # PlayByPlayV3 -> pbp.db (includes cross-table validation)
+  fetch_players.py        # BoxScoreTraditionalV3 -> players.db
+  raw/                    # SQLite DBs (games.db, pbp.db, players.db) — gitignored
+  processed/              # Parquet feature matrices — gitignored
+features/
+  elo.py                  # Walk-forward ELO ratings (K=100, season regression 25%)
+  pregame.py              # 9 pre-game features as home-minus-away differentials
+  ingame.py               # 18 in-game features per PBP event + possession state machine
+  pipeline.py             # Orchestrates elo -> pregame -> ingame, writes parquet
+model/
+  train_pregame.py        # Calibrated LR (Platt scaling) -> pregame.pkl + pregame_probs.parquet
+  train_ingame.py         # XGBoost + StratifiedCalibrator -> ingame.pkl
+  evaluate.py             # Reliability diagrams, SHAP, per-quarter calibration
+  train.sh                # Shell script to run both training stages in sequence
+  eval_figures/           # Generated PNG plots (gitignored pkl files)
+live/
+  game_state.py           # GameState class — incremental in-game state, produces feature vector
+  poller.py               # Live polling (NBA live endpoint) + replay (SQLite) + pregame lookup
+  api.py                  # FastAPI server: REST + WebSocket + background poll tasks
+web/                      # Next.js 16 dashboard (app router, TypeScript, Tailwind v4)
+  src/app/                # Pages: / (game selector), /game/[gameId], /backtest
+  src/components/         # Scoreboard, WinProbChart, PlayByPlayFeed, BoxScore, etc.
+  src/hooks/              # useGameWebSocket (WebSocket + REST fallback)
+  src/lib/                # teamMeta, api client, formatters, momentum detection
+  src/types/              # TypeScript interfaces for API responses
+  .env.local              # NEXT_PUBLIC_API_URL=http://localhost:8000
+dashboard/
+  app.py                  # Legacy Streamlit dashboard (deprecated, has rendering bugs)
+tests/
+  test_game_state.py      # Unit tests for GameState (score, clock, shooting, possessions, dedup)
+  test_no_leakage.py      # Feature leakage + data integrity assertions (needs populated DBs)
+  test_live_pregame.py    # Live pregame fallback computation tests
+notebooks/
+  eda.ipynb               # Exploratory data analysis
+```
 
 ## Commands
 
-All phases are implemented.
-
 ```bash
-# Data collection (run once, takes hours — batches and caches aggressively)
-python data/fetch_games.py
-python data/fetch_pbp.py
-python data/fetch_players.py
+# All commands run from project root unless noted otherwise.
 
-# Feature engineering
-python features/pipeline.py
+# --- Data collection (run once, takes hours cold — caches aggressively) ---
+python data/fetch_games.py                    # ~20 API calls, seconds
+python data/fetch_pbp.py                      # ~13K API calls, hours cold
+python data/fetch_players.py                  # ~13K API calls, hours cold
+python data/fetch_pbp.py --resume             # retry only failed games
+python data/fetch_games.py --season 2023-24   # single season
 
-# Training (two-stage: pre-game first, then in-game)
-python model/train_pregame.py      # outputs model/pregame.pkl + data/processed/pregame_probs.parquet
-python model/train_ingame.py       # requires pregame_probs.parquet; outputs model/ingame.pkl
-python model/train_ingame.py --sweep  # optional: 2-stage hyperparameter search (~2 hrs)
+# --- Feature engineering ---
+python features/pipeline.py                   # outputs pregame_features.parquet + ingame_snapshots.parquet
 
-# Evaluation
-python model/evaluate.py           # saves figures to model/eval_figures/ (created at runtime)
+# --- Training (order matters: pregame first) ---
+python model/train_pregame.py                 # -> pregame.pkl + pregame_probs.parquet
+python model/train_ingame.py                  # -> ingame.pkl (requires pregame_probs.parquet)
+python model/train_ingame.py --sweep          # hyperparameter search (~2 hrs)
+bash model/train.sh                           # runs both stages, logs to model/logs/
+bash model/train.sh --sweep                   # with hyperparam sweep
 
-# Find today's live game IDs
+# --- Evaluation ---
+python model/evaluate.py                      # saves figures to model/eval_figures/
+
+# --- Tests ---
+pytest tests/test_game_state.py -v            # fast, no DB needed
+pytest tests/test_no_leakage.py -v            # needs populated DBs + parquet
+pytest tests/test_live_pregame.py -v          # needs games.db
+
+# --- Live inference ---
+uvicorn live.api:app --reload                 # FastAPI server on :8000
+python live/poller.py --game_id <ID>          # CLI live polling
+python live/poller.py --game_id <ID> --replay # replay from pbp.db
+
+# --- Frontend ---
+cd web && npm install && npm run dev          # Next.js on :3000
+
+# --- Find today's live game IDs ---
 python3 -c "
 from nba_api.live.nba.endpoints import scoreboard
 sb = scoreboard.ScoreBoard()
 for g in sb.get_dict()['scoreboard']['games']:
     print(g['gameId'], g['awayTeam']['teamTricode'], '@', g['homeTeam']['teamTricode'], g['gameStatusText'])
 "
-
-# Live inference — must run from project root
-uvicorn live.api:app --reload          # start FastAPI server (required for dashboard)
-python live/poller.py --game_id <GAME_ID>          # CLI polling (prints to stdout + CSV)
-python live/poller.py --game_id <GAME_ID> --replay  # replay a completed game from pbp.db
-
-# React dashboard — must run from project root
-cd web && npm run dev                  # starts Next.js dev server on http://localhost:3000
-
-# Legacy Streamlit dashboard (deprecated, being replaced by web/)
-streamlit run dashboard/app.py
 ```
 
 ## Architecture
 
-The system has five layers: data → features → model → live inference → dashboard. Training flows through them in sequence; live inference loops through layers 3–5.
+Five layers: **data -> features -> model -> live inference -> dashboard**.
 
-**Data layer** (`data/`) — Three fetch modules hit the NBA Stats API and cache to SQLite (`data/raw/`). Always check local cache before hitting the API. Rate-limit all calls with `time.sleep(0.6)`.
+Training flows through all five in sequence. Live inference loops through layers 3-5.
 
-**Feature layer** (`features/`) — Two feature classes concatenated at inference time:
-- `pregame.py` computes static features once before tip-off (ELO, rolling team stats, rest days, `ast_pct_diff`, `tov_pct_diff`, `prev_season_win_pct_diff`). Frozen at tip-off — no lineup-lock re-fetch.
-- `ingame.py` updates after every play event (score diff, time remaining, `last_5_poss_swing`, foul counts, timeout diff, live FG%/2PT%/3PT%/FT%, `clutch_flag`).
-- `pipeline.py` concatenates both into a single vector for the in-game model.
+### Data layer (`data/`)
+Three fetch scripts hit the NBA Stats API, cache to SQLite (`data/raw/`). Always check cache before API. Rate-limit: `time.sleep(0.6)` between calls. Three databases: `games.db` (game_logs + team_efficiency), `pbp.db` (play_by_play), `players.db` (player_box_scores). All use WAL mode with indexes on game_id, season, team_id.
 
-**Model layer** (`model/`) — Two-stage:
-1. `train_pregame.py`: scikit-learn `LogisticRegression` + `CalibratedClassifierCV` (Platt scaling). Outputs `pre_game_prob`.
-2. `train_ingame.py`: XGBoost (`binary:logistic`, best params from sweep: depth 4, lr 0.05, min_child_weight 20, subsample 0.9, reg_alpha 0.1, reg_lambda 5.0, 1000 trees with early stopping) takes `pre_game_prob` as an input feature. Post-hoc stratified isotonic calibration via `StratifiedCalibrator`. Both saved with `joblib`.
-- **Intermediate artifact:** `data/processed/pregame_probs.parquet` — `[game_id, pre_game_prob]` for all ~11,974 games. Training games use out-of-fold (`cross_val_predict`) predictions to avoid leakage into the in-game model; val/test/holdout use the calibrated model directly.
+### Feature layer (`features/`)
+- `pregame.py`: 9 features as home-minus-away differentials. Frozen at tip-off. Uses `cumsum().shift(1)` for season-to-date stats (excludes current game). ORtg/DRtg from previous season's `team_efficiency`.
+- `ingame.py`: 18 features per PBP event. Possession state machine for `last_5_poss_swing`. Timeout team parsed from description (team_id is 0). Score forward-filled with `ffill()`. OT clock goes negative.
+- `pipeline.py`: Orchestrates both, writes parquet.
 
-**Live inference layer** (`live/`) — `GameState` holds all mutable in-game state and is updated incrementally (never recomputed from scratch). For live games, `poller.py` uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` (the stats API `PlayByPlayV3` returns 0 rows for in-progress games). Deduplicates by `actionNumber` mapped to `actionId`. `api.py` is a FastAPI server with REST + WebSocket endpoints, managing background polling tasks per game.
+### Model layer (`model/`)
+Two-stage:
+1. **Pre-game**: `LogisticRegression` + `CalibratedClassifierCV` (Platt scaling). Outputs `pre_game_prob`.
+2. **In-game**: XGBoost (depth 4, lr 0.05, 1000 trees, early stopping) + `StratifiedCalibrator` with 3 phase-specific isotonic calibrators (Q1-Q2, Q3-Q4, OT).
 
-**Dashboard** (`web/`) — Next.js + TypeScript + Tailwind CSS + Recharts. Connects to the FastAPI server via WebSocket (`/ws/{game_id}`) for real-time updates with REST polling fallback. Dark broadcast-style theme. Components: Scoreboard, WinProbChart, PlayByPlayFeed, BoxScore, MomentumPanel, PregameBreakdown.
+Split by season: Train 2015-2022, Val 2022-23, Test 2023-24. Holdout 2024-25 and 2025-26. Calibration carved from training data (15% by game_id). OT calibrator exception: uses val OT rows only (era shift in OT home-win rates).
 
-**Legacy dashboard** (`dashboard/app.py`) — Streamlit. Deprecated but still functional. Has a rendering bug with HTML/CSS in the scoreboard (displays raw markup). Being replaced by `web/`.
+Intermediate artifact: `pregame_probs.parquet` — training games use out-of-fold predictions (`cross_val_predict`) to prevent leakage.
 
-## API Endpoints (live/api.py)
+### Live inference layer (`live/`)
+- `GameState`: incremental in-memory state, deduplicates by `actionId`/`actionNumber`, produces 18-element feature vector.
+- `poller.py`: live mode uses `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` (stats API `PlayByPlayV3` returns 0 rows for live games). Replay mode reads from `pbp.db`. Falls back to on-the-fly pregame computation for games not in parquet (e.g., playoffs).
+- `api.py`: FastAPI with REST + WebSocket. Background `_poll_loop` per game. Poll interval 15s with WS clients, 30s without.
+
+### Dashboard (`web/`)
+Next.js 16 app router. WebSocket connection via `useGameWebSocket` hook with auto-reconnect (exponential backoff) and REST polling fallback. `/live/` and `/replay/` return identical response shapes.
+
+## API endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/pregame/{game_id}` | GET | Pre-game win probability |
-| `/pregame/{game_id}/breakdown` | GET | Pre-game feature values + human-readable labels |
-| `/live/{game_id}` | GET | Current live state + prob_history + play_log + box_score |
-| `/games?season=2024-25` | GET | Game list for replay selector (seasons + games) |
+| `/pregame/{game_id}` | GET | Pre-game probability |
+| `/pregame/{game_id}/breakdown` | GET | Pre-game features + labels |
+| `/live/{game_id}` | GET | Current state + prob_history + play_log + box_score |
+| `/games?season=2024-25` | GET | Game list for replay selector |
 | `/replay/{game_id}` | GET | Full server-side replay from pbp.db |
-| `/ws/{game_id}` | WebSocket | Real-time push updates (broadcasts on each poll cycle) |
-| `/figures/{filename}` | Static | Evaluation figures from model/eval_figures/ |
+| `/ws/{game_id}` | WebSocket | Real-time push on each poll cycle |
+| `/figures/{filename}` | Static | Evaluation figures |
 
-The `/live/` and `/replay/` endpoints return the same response shape — the frontend uses identical components for both. The response includes a `box_score` object with per-team shooting stats (FG/2PT/3PT/FT made+attempted+pct, fouls, turnovers, timeouts_remaining), sourced from `GameState` attributes.
+## Feature lists (exact order matters)
 
-## Frontend (web/)
+**PREGAME_FEATURES** (9): `elo_diff`, `efg_pct_diff`, `ortg_diff`, `drtg_diff`, `prev_season_win_pct_diff`, `rest_days_diff`, `home_flag`, `ast_pct_diff`, `tov_pct_diff`
 
-Next.js 16 app router with TypeScript. Key files:
+**INGAME_FEATURES** (18): `score_diff`, `seconds_remaining`, `pre_game_prob`, `home_fg_pct_live`, `away_fg_pct_live`, `home_2pt_pct_live`, `away_2pt_pct_live`, `home_3pt_pct_live`, `away_3pt_pct_live`, `home_ft_pct_live`, `away_ft_pct_live`, `home_fouls`, `away_fouls`, `turnover_diff_live`, `timeout_remaining_diff`, `last_5_poss_swing`, `quarter` (index 16), `clutch_flag`
 
-| File | Purpose |
-|---|---|
-| `src/app/page.tsx` | Landing page — game selector (live ID input + historical game browser) |
-| `src/app/game/[gameId]/page.tsx` | Game dashboard — scoreboard, chart, tabbed panels |
-| `src/app/backtest/page.tsx` | Model evaluation report |
-| `src/hooks/useGameWebSocket.ts` | WebSocket hook with auto-reconnect + REST fallback |
-| `src/lib/teamMeta.ts` | Team colors, names, IDs (30 teams), logo URL helper |
-| `src/lib/api.ts` | REST client functions |
-| `src/lib/momentum.ts` | Client-side momentum/runs/lead-change detection |
-| `src/components/Scoreboard.tsx` | Team logos, scores, clock, win probability bar |
-| `src/components/WinProbChart.tsx` | Recharts area chart (ESPN-style, inverted y-axis) |
-| `src/components/PlayByPlayFeed.tsx` | Scrollable play-by-play table |
-| `src/components/BoxScore.tsx` | Two-column shooting splits comparison |
-| `src/components/MomentumPanel.tsx` | Top 5 swings, lead changes, largest run |
-| `src/components/PregameBreakdown.tsx` | Diverging bar chart of pre-game features |
+## Critical constraints / gotchas
 
-**Dependencies:** `recharts` (charting), `lucide-react` (icons). Config in `web/.env.local`: `NEXT_PUBLIC_API_URL=http://localhost:8000`.
+1. **`StratifiedCalibrator` import order**: Must be imported before `joblib.load("ingame.pkl")`. Both `api.py` and `poller.py` handle this. `api.py` also registers it on `__main__` for deserialization safety. If you add a new module that loads ingame.pkl, you must import `StratifiedCalibrator` first.
 
-## Key constraints
+2. **Training order**: `train_pregame.py` MUST run before `train_ingame.py` — the in-game model requires `pregame_probs.parquet`.
 
-- **Clock encoding:** `time_remaining_game = (4 - period) * 720 + clock_seconds` for regulation. OT periods are 300 seconds (not 720) and must be handled separately or the feature is garbage in OT games.
-- **Calibration split:** train → calibrate → validate are three distinct data splits. The OT isotonic calibrator is the one exception: it uses val OT rows only (cal OT rows excluded — era shift). Q1-Q4 calibrators never use val data.
-- **Leakage:** every training row must only contain features derivable from plays at or before that event's clock timestamp. Enforce with a per-row assertion during dataset construction.
-- **Logging:** write to the probability CSV on new events only, not on every poll cycle.
-- **Model persistence:** use `joblib`, not `pickle`.
-- **StratifiedCalibrator import:** Must be imported before `joblib.load("ingame.pkl")` — both `api.py` and `poller.py` handle this. `api.py` also registers it on `__main__` for deserialization safety.
-- **WebSocket lifecycle:** `_ws_connections` tracks clients per game. `_poll_loop` broadcasts to all connected clients after processing new events. Dead connections are pruned on send failure.
+3. **Clock encoding**: Regulation: `(4 - period) * 720 + clock_seconds`. OT: `-((period - 5) * 300 + (300 - clock_seconds))`. OT produces negative values. Using the regulation formula for OT produces garbage. The `quarter` feature at index 16 disambiguates.
+
+4. **Feature leakage**: Every training row must only use data available at that event's timestamp. Rolling stats use `cumsum().shift(1)` to exclude the current game. ORtg/DRtg come from the *previous* season. `pre_game_prob` uses out-of-fold predictions for training games.
+
+5. **Score forward-fill**: PBP `score_home`/`score_away` are NULL on ~60% of events. Must `ffill()` after sorting by `action_number`, with initial value (0, 0).
+
+6. **Live vs stats API**: `nba_api.live.nba.endpoints.playbyplay.PlayByPlay` for live games. `PlayByPlayV3` for historical replay only. Live API has no `actionId` field — deduplicate on `actionNumber` mapped to `actionId`.
+
+7. **OT calibrator exception**: Uses val OT rows only (2022-23), NOT cal OT rows. This is deliberate — OT home-win rates shifted from ~44% (2015-2022) to ~64% (2023-24). Q1-Q4 calibrators never touch val data.
+
+8. **Timeout team_id is 0**: Parse the team from the `description` field regex, not `team_id`.
+
+9. **`SEASONS` list**: Must cover 2015-16 through 2025-26 in all three fetch scripts. If you add a season, update all three.
+
+10. **Model artifacts are gitignored**: `model/*.pkl` and `data/processed/*.parquet` are not committed. Must regenerate locally.
+
+11. **`GameState.to_feature_vector()` must match `INGAME_FEATURES` order exactly**: If you add/remove/reorder features, update both `train_ingame.py` and `game_state.py` together, and retrain.
+
+12. **Next.js 16 in `web/`**: This is a newer version than typical. Read `web/AGENTS.md` before modifying — APIs may differ from training data.
+
+## Code conventions
+
+- Python: no type stubs, uses `from __future__ import annotations`. `Path` for file paths. `snake_case` everywhere.
+- All Python scripts use `sys.path.insert(0, str(ROOT))` for imports from project root.
+- Constants defined at module top (UPPER_CASE). No config files — constants live in the modules that use them.
+- SQLite connections: `PRAGMA journal_mode=WAL`, explicit `CREATE INDEX IF NOT EXISTS`.
+- Frontend: `@/*` path alias for `./src/*`. Components are single-file. No CSS modules — Tailwind only.
+- No `.env.example` — the only env var is `NEXT_PUBLIC_API_URL=http://localhost:8000` in `web/.env.local`.
+
+## Environment variables
+
+| Variable | Where | Default | Purpose |
+|---|---|---|---|
+| `NEXT_PUBLIC_API_URL` | `web/.env.local` | `http://localhost:8000` | FastAPI server URL for frontend |
+
+No other env vars. No API keys needed — `nba_api` uses public NBA endpoints.
